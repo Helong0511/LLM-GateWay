@@ -44,6 +44,7 @@ from app.providers.upstream_pricing import (
     suggest_prices,
 )
 from app.security.ssrf import Resolver, fetch_checked, inspect_url
+from app.providers.litellm_registry import LiteLLMRegistry, RegistryError
 
 _SYNC_NAME_SAMPLE = 8
 
@@ -70,6 +71,7 @@ class ProviderService:
         transport: httpx.AsyncBaseTransport | None,
         *,
         upstream_client: httpx.AsyncClient | None = None,
+        registry: LiteLLMRegistry | None = None,
     ) -> None:
         self.session = session
         self.clock = clock
@@ -77,6 +79,7 @@ class ProviderService:
         self.resolver = resolver
         self.transport = transport
         self.client = upstream_client  # 全局持久化 httpx.AsyncClient（连接池复用）
+        self.registry = registry if registry is not None else LiteLLMRegistry(settings)
 
     @asynccontextmanager
     async def _http(self, timeout: float) -> AsyncIterator[httpx.AsyncClient]:
