@@ -1,0 +1,191 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-border: hsl(var(--border));
+  --color-muted: hsl(var(--muted));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-danger: hsl(var(--danger));
+  --color-success: hsl(var(--success));
+  --color-warning: hsl(var(--warning));
+  --color-info: hsl(var(--info));
+  --font-sans: var(--font-body), "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-mono: var(--font-code), "Cascadia Code", "Sarasa Mono SC", ui-monospace, monospace;
+}
+
+:root {
+  /* 冷灰底 + 青绿仪器强调，偏算力网关而不是消费级紫霓虹 */
+  --background: 210 28% 97%;
+  --foreground: 222 36% 10%;
+  --card: 210 40% 99%;
+  --border: 210 24% 84%;
+  --muted: 208 28% 93%;
+  --primary: 186 78% 28%;
+  --primary-foreground: 180 40% 98%;
+  --accent: 186 90% 36%;
+  --danger: 0 72% 48%;
+  --danger-fg: 0 65% 32%;
+  --success: 152 62% 34%;
+  --success-fg: 152 70% 22%;
+  --warning: 36 92% 42%;
+  --warning-fg: 28 80% 28%;
+  --info: 210 70% 42%;
+  --info-fg: 214 55% 28%;
+  --grid: 210 20% 80%;
+  --glow: 186 80% 42%;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: 222 42% 5%;
+  --foreground: 198 28% 94%;
+  --card: 222 36% 8%;
+  --border: 210 24% 18%;
+  --muted: 218 28% 12%;
+  --primary: 178 72% 42%;
+  --primary-foreground: 222 42% 6%;
+  --accent: 178 80% 48%;
+  --danger: 0 72% 58%;
+  --danger-fg: 0 85% 78%;
+  --success: 152 58% 48%;
+  --success-fg: 152 70% 78%;
+  --warning: 38 90% 55%;
+  --warning-fg: 40 95% 78%;
+  --info: 205 80% 58%;
+  --info-fg: 200 80% 82%;
+  --grid: 210 20% 18%;
+  --glow: 178 80% 45%;
+}
+
+html {
+  scroll-behavior: smooth;
+  color-scheme: light;
+}
+
+body {
+  position: relative;
+  min-height: 100vh;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: var(--font-sans);
+  letter-spacing: -0.011em;
+}
+
+/* 原生 select：避免 Windows 下透明底展开成白块、选项字看不清 */
+select {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+select option,
+select optgroup {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(ellipse 80% 55% at 12% -10%, hsl(var(--glow) / 0.14), transparent 55%),
+    radial-gradient(ellipse 60% 45% at 100% 0%, hsl(210 80% 55% / 0.08), transparent 50%),
+    linear-gradient(180deg, hsl(var(--background)), hsl(var(--background)));
+}
+
+body::after {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  opacity: 0.35;
+  background-image:
+    linear-gradient(to right, hsl(var(--grid) / 0.45) 1px, transparent 1px),
+    linear-gradient(to bottom, hsl(var(--grid) / 0.45) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(180deg, black, transparent 88%);
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display), var(--font-sans);
+  letter-spacing: -0.03em;
+}
+
+pre,
+code,
+kbd,
+samp,
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+::selection {
+  background: hsl(var(--accent) / 0.22);
+}
+
+a {
+  text-underline-offset: 3px;
+}
+
+.tech-panel {
+  position: relative;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--card) / 0.86);
+  backdrop-filter: blur(10px);
+  box-shadow: inset 0 1px 0 hsl(var(--primary-foreground) / 0.04);
+}
+
+.tech-panel::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 18px;
+  height: 18px;
+  border-top: 2px solid hsl(var(--accent) / 0.7);
+  border-left: 2px solid hsl(var(--accent) / 0.7);
+  pointer-events: none;
+}
+
+.tech-panel::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  border-right: 2px solid hsl(var(--accent) / 0.45);
+  border-bottom: 2px solid hsl(var(--accent) / 0.45);
+  pointer-events: none;
+}
+
+.tech-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: hsl(var(--accent));
+}
+
+.tech-eyebrow::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 1px;
+  background: hsl(var(--accent));
+  box-shadow: 0 0 0 3px hsl(var(--accent) / 0.18);
+}

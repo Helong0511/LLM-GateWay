@@ -1,0 +1,17 @@
+# 与 deploy/docker-compose.yml 叠加：
+# docker compose --env-file .env -f deploy/docker-compose.yml -f deploy/docker-compose.staging.yml up --build
+# staging 允许沙箱/mock，但页面必须能从 /api/meta 看出 mock 是否开启。
+services:
+  api:
+    environment:
+      APP_ENV: staging
+      SESSION_IDLE_HOURS: ${SESSION_IDLE_HOURS:-12}
+      SESSION_ABSOLUTE_HOURS: ${SESSION_ABSOLUTE_HOURS:-168}
+      PG_DUMP_PATH: ${PG_DUMP_PATH:-}
+      BACKUP_DOCKER_IMAGE: ${BACKUP_DOCKER_IMAGE:-postgres:16.10-alpine}
+      BACKUP_ALLOW_DOCKER: ${BACKUP_ALLOW_DOCKER:-true}
+  worker:
+    environment:
+      APP_ENV: staging
+      SESSION_IDLE_HOURS: ${SESSION_IDLE_HOURS:-12}
+      SESSION_ABSOLUTE_HOURS: ${SESSION_ABSOLUTE_HOURS:-168}

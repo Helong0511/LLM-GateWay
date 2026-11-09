@@ -1,0 +1,18 @@
+---
+description: 改配置项时同步更新所有环境配置文件
+alwaysApply: true
+---
+
+# 配置变更必须全环境同步
+
+新增或修改任何运行时配置（环境变量、Settings 字段、会话/支付/密钥相关默认值）时：
+
+1. **代码默认值**：`apps/api/app/core/config.py`（或对应模块）
+2. **开发本地**：根目录 `.env`（若存在）与 `.env.example`
+3. **编排**：`deploy/docker-compose.yml`、`deploy/docker-compose.staging.yml`、`deploy/docker-compose.prod.yml`（需要显式传入或 `${VAR:-默认}`）
+4. **文档**：`README.md` 变量表；涉及部署时同步 `docs/DEPLOYMENT.md` / `docs/RUNBOOK.md`
+5. **测试**：相关 pytest 覆盖新行为；必要时在测试 `Settings(...)` 中显式传入
+
+禁止只改代码默认或只改 `.env.example` 就结束。生产与预发不得静默落到过时默认（例如旧的「长期不过期」会话）。
+
+用户规则：上游=广告主，下游=客户；对话用简体中文。

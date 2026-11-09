@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: 安装后端依赖
+        run: uv sync --project apps/api --frozen
+      - name: ruff
+        working-directory: apps/api
+        run: uv run ruff check app alembic
+      - name: mypy
+        working-directory: apps/api
+        run: uv run mypy app
+      - name: pytest
+        run: uv run --project apps/api pytest
+      - name: pip-audit
+        run: uv run --project apps/api pip-audit
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: 安装前端依赖
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile
+      - name: lint
+        working-directory: apps/web
+        run: pnpm lint
+      - name: vitest
+        working-directory: apps/web
+        run: pnpm test
+      - name: build
+        working-directory: apps/web
+        run: pnpm build
