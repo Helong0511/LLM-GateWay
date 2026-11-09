@@ -16,4 +16,8 @@ EXPOSE 8000
 # --proxy-headers + --forwarded-allow-ips：让 request.client.host 变成真实客户端 IP。
 # 少这一行，注册限流会退化成「全站每小时 20 次」，Key / USDT 的 IP 白名单全部失效。
 # API 容器不允许对外发布端口（见 deploy/docker-compose.prod.yml），因此信任内网代理。
-CMD ["sh", "-c", "exec uv run --frozen --no-dev uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=\"${FORWARDED_ALLOW_IPS:-*}\" --no-server-header"]
+#
+# --workers：单进程在 async I/O 下够用，但 JSON 编解码 / 加解密会串行，且一崩全断。
+# 每多一个 worker，PG 连接数就多一份 (DB_POOL_SIZE + DB_MAX_OVERFLOW)，
+# 调整 workers 时必须同步下调这两个值（compose 里已按 2 workers 调过）。
+CMD ["sh", "-c", "exec uv run --frozen --no-dev uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers \"${UVICORN_WORKERS:-2}\" --proxy-headers --forwarded-allow-ips=\"${FORWARDED_ALLOW_IPS:-*}\" --no-server-header"]

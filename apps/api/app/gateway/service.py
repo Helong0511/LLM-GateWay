@@ -462,7 +462,13 @@ class GatewayService:
         return self.settings.litellm_base_url.rstrip("/") + path
 
     def _headers(self) -> dict[str, str]:
-        return {"authorization": f"Bearer {self.settings.litellm_master_key}"}
+        headers = {"authorization": f"Bearer {self.settings.litellm_master_key}"}
+        # 把请求 ID 传给 LiteLLM：它会把该 ID 写进自己的日志并透传给上游，
+        # 出问题时才能从「用户投诉的那一次调用」一路查到 Provider。
+        request_id = structlog.contextvars.get_contextvars().get("request_id")
+        if isinstance(request_id, str) and request_id:
+            headers["x-request-id"] = request_id
+        return headers
 
     def _billing(self) -> BillingService:
         return BillingService(self.session, self.clock, self.settings, self.keys.cache)

@@ -9,6 +9,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.metrics import API_ERRORS, REGISTRY
+
 # 资金类错误码只在这里定义一次，业务代码一律引用常量，禁止再写字符串字面量。
 # 历史上曾出现 BALANCE_INSUFFICIENT / INSUFFICIENT_BALANCE 两套写法并存，
 # 导致「实付超预扣 + 余额不足」时结算兜底失效（见 CODE_REVIEW_2026-11-09 P0-4）。
@@ -181,8 +183,9 @@ MESSAGE_BY_CODE: dict[str, str] = {
     "BACKUP_SQL_CONNECT_FAILED": "无法连接数据库做 SQL 备份：{error}。请确认 PostgreSQL 已启动且 DATABASE_URL 正确",
     "BACKUP_SQL_FAILED": "SQL 备份未完成：{error}。请检查账号是否有读表权限",
     "BACKUP_EMPTY_FILE": "备份文件未生成或大小为 0，请检查权限与磁盘空间",
-    "BACKUP_NAME_INVALID": "备份文件名不合法（仅允许 .dump / .sql）",
+    "BACKUP_NAME_INVALID": "备份文件名不合法（仅允许 .dump / .sql / .enc）",
     "BACKUP_FILE_NOT_FOUND": "备份文件不存在",
+    "BACKUP_ENCRYPTION_KEY_INVALID": "备份加密密钥格式不正确，应为 Fernet key（base64）",
     "GATEWAY_DB_NOT_READY": "数据库未就绪",
     "GATEWAY_MODEL_REQUIRED": "必须提供模型名称",
     "GATEWAY_KEY_USER_MISSING": "密钥所属账号不存在",
@@ -350,6 +353,7 @@ def failure(
 def register_exception_handlers(app: Any) -> None:
     @app.exception_handler(AppError)
     async def _app_error(request: Request, exc: AppError) -> JSONResponse:
+        REGISTRY.counter(API_ERRORS, {"code": exc.code})
         return failure(request, exc.status_code, exc.code, exc.message, exc.details)
 
     @app.exception_handler(RequestValidationError)
@@ -365,7 +369,9 @@ def register_exception_handlers(app: Any) -> None:
         code = CODE_BY_STATUS.get(exc.status_code, "VALIDATION_ERROR" if exc.status_code < 500 else "INTERNAL")
         message = MESSAGE_BY_CODE.get(code, "操作未成功，请稍后再试")
         if exc.status_code == 405:
+            REGISTRY.counter(API_ERRORS, {"code": "METHOD_NOT_ALLOWED"})
             return failure(request, exc.status_code, "METHOD_NOT_ALLOWED")
+        REGISTRY.counter(API_ERRORS, {"code": code})
         return failure(request, exc.status_code, code, message)
 
     @app.exception_handler(Exception)

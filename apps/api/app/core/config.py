@@ -32,6 +32,13 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://forge:forge-dev-only@127.0.0.1:5432/forge"
     redis_url: str = "redis://127.0.0.1:6379/0"
+    # 限流/并发闸单独一个 db（默认 db1）：arq 队列绝不能因为缓存淘汰而丢任务，
+    # 两者分库后至少不会互相 FLUSH；彻底隔离需要指向独立实例。
+    redis_rate_limit_url: str = "redis://127.0.0.1:6379/1"
+
+    # /metrics 抓取开关。token 非空时要求 `Authorization: Bearer <token>`。
+    metrics_enabled: bool = True
+    metrics_token: str = ""
 
     session_secret: str = "dev-only-session-secret-change-me-32bytes"
     encryption_master_key: str = "dev-only-encryption-master-key-32bytes"
@@ -59,9 +66,17 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://127.0.0.1:3000,http://localhost:3000"
     max_body_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
+    # 连接池按进程计：多 worker 时总连接数 = (pool_size + max_overflow) × workers，
+    # 必须与 PG 的 max_connections 对齐（另需给 worker 与 LiteLLM 留余量）。
+    db_pool_size: int = Field(default=5, ge=1)
+    db_max_overflow: int = Field(default=10, ge=0)
 
     litellm_base_url: str = "http://127.0.0.1:4000"
     litellm_master_key: str = "sk-dev-only-litellm-master-key"
+    # LiteLLM 自己的库（spend_logs / request_logs）。留空则不清理，
+    # 生产建议指向同一个 PG 的 litellm database，由 worker 每天按保留期分批删除。
+    litellm_database_url: str = ""
+    litellm_log_retention_days: int = Field(default=30, ge=1)
     # 上架/下架/换凭证时把 deployment 同步到 LiteLLM Admin API。
     # 关闭后 /v1 仍会转发，但 LiteLLM 侧不会知道新模型（仅用于离线调试）。
     litellm_sync_enabled: bool = True
@@ -88,6 +103,9 @@ class Settings(BaseSettings):
     pg_dump_path: str = ""
     backup_docker_image: str = "postgres:16.10-alpine"
     backup_allow_docker: bool = True
+    # 备份落盘加密（Fernet key，base64）。留空则备份为明文，仅适合本地开发；
+    # 生产备份含密码哈希与加密后的上游凭证，必须开启，否则一次磁盘泄漏就是全量泄漏。
+    backup_encryption_key: str = ""
 
     @field_validator("operating_mode", "app_env", mode="before")
     @classmethod

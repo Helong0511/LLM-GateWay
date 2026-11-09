@@ -1,10 +1,19 @@
+# 静态模型列表刻意留空：模型由控制面（apps/api）在「上架 / 下架 / 换凭证」时
+# 通过 Admin API（POST /model/new、POST /model/delete）动态注册，
+# 以 model_info.id = model_deployments.id 保证幂等。
+# store_model_in_db 必须为 true，否则 Admin API 注册的模型仅存于内存，
+# LiteLLM 重启后全部丢失，表现为「上架过的模型突然 404」。
 model_list: []
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
 
 litellm_settings:
   drop_params: true
   set_verbose: false
   json_logs: true
+  # 不把请求/响应正文写进 LiteLLM 日志表：中转站最容易被忽视的泄漏面就是
+  # 「日志里存着别人的 prompt」。只保留 token 数与耗时用于计费核对。
+  turn_off_message_logging: true

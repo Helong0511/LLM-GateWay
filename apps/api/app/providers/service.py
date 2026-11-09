@@ -11,11 +11,13 @@ from decimal import Decimal
 from uuid import UUID
 
 import httpx
+import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.audit import append_audit
 from app.auth.crypto import decrypt_text, encrypt_text
+from app.auth.tokens import as_utc
 from app.billing.money import format_money, settlement_currency
 from app.core.clock import Clock
 from app.core.config import Settings
@@ -30,6 +32,7 @@ from app.db.models.providers import (
     Provider,
     ProviderCredential,
 )
+from app.providers.litellm_registry import LiteLLMRegistry, RegistryError
 from app.providers.presets import (
     auth_headers,
     default_protocol,
@@ -44,7 +47,8 @@ from app.providers.upstream_pricing import (
     suggest_prices,
 )
 from app.security.ssrf import Resolver, fetch_checked, inspect_url
-from app.providers.litellm_registry import LiteLLMRegistry, RegistryError
+
+logger = structlog.get_logger(__name__)
 
 _SYNC_NAME_SAMPLE = 8
 
@@ -168,6 +172,8 @@ class ProviderService:
         )
         self.session.add(created)
         await self.session.flush()
+        # 凭证轮换后必须重推：LiteLLM 里存的是上一次的 key，不重推会一直 401。
+        await self._push_provider(provider.id)
         await self._audit(actor_id, "credential.rotate", "provider", str(provider.id), created.secret_hint)
         return {"id": str(created.id), "label": created.label, "hint": created.secret_hint, "status": created.status}
 
@@ -304,16 +310,19 @@ class ProviderService:
         existing = await self.session.execute(select(ModelDeployment).where(ModelDeployment.model_id == row.id))
         deployment = existing.scalar_one_or_none()
         if deployment is None:
-            self.session.add(
-                ModelDeployment(
-                    model_id=row.id,
-                    provider_id=row.provider_id,
-                    status="active",
-                    created_at=self.clock.now(),
-                )
+            deployment = ModelDeployment(
+                model_id=row.id,
+                provider_id=row.provider_id,
+                status="active",
+                created_at=self.clock.now(),
             )
+            self.session.add(deployment)
         elif not was_published:
             deployment.status = "active"
+        # 先落 id 再注册：LiteLLM 用 deployment.id 做幂等键与删除目标。
+        await self.session.flush()
+        if deployment.status == "active":
+            await self._push_deployment(deployment, row, await self._provider(row.provider_id))
         await self._audit(actor_id, "model.publish", "model", str(row.id), row.public_name)
         return self._public_model(row)
 
@@ -399,6 +408,8 @@ class ProviderService:
             )
             for deployment in deployments.scalars().all():
                 deployment.status = "disabled"
+                # 下架必须同步撤销，否则 LiteLLM 仍会接单，出现「已下架还能调用」。
+                await self._drop_deployment(deployment)
             unpublished += 1
         await self.session.flush()
         await self._audit(
@@ -455,6 +466,10 @@ class ProviderService:
         if status == "active" and (catalog is None or catalog.status != "published"):
             raise AppError(409, "DEPLOYMENT_MODEL_UNPUBLISHED")
         row.status = status
+        if status == "active" and catalog is not None:
+            await self._push_deployment(row, catalog, await self._provider(row.provider_id))
+        elif status == "disabled":
+            await self._drop_deployment(row)
         await self._audit(actor_id, "deployment.status", "deployment", str(row.id), status)
         provider = await self.session.get(Provider, row.provider_id)
         return {
@@ -496,6 +511,7 @@ class ProviderService:
             if row is None:
                 missing += 1
                 continue
+            catalog: ModelCatalog | None = None
             if status == "active":
                 catalog = await self.session.get(ModelCatalog, row.model_id)
                 if catalog is None or catalog.status != "published":
@@ -505,6 +521,11 @@ class ProviderService:
                 skipped += 1
                 continue
             row.status = status
+            if status == "active":
+                assert catalog is not None
+                await self._push_deployment(row, catalog, await self._provider(row.provider_id))
+            else:
+                await self._drop_deployment(row)
             updated += 1
         await self._audit(
             actor_id,
@@ -755,6 +776,119 @@ class ProviderService:
                 names.append(id_to_name.get(model_id, str(model_id)))
         return names
 
+    async def _push_deployment(
+        self,
+        deployment: ModelDeployment,
+        catalog: ModelCatalog,
+        provider: Provider,
+        *,
+        secret: str | None = None,
+    ) -> bool:
+        """把一条 active 部署注册到 LiteLLM。失败只记状态，不影响本地事务。"""
+        if not self.registry.configured:
+            return False
+        try:
+            key = secret if secret is not None else await self._secret(provider.id)
+            await self.registry.upsert(
+                deployment_id=str(deployment.id),
+                model_name=catalog.upstream_name,
+                kind=provider.kind,
+                upstream_name=catalog.upstream_name,
+                api_base=provider.base_url,
+                api_key=key,
+            )
+        except (RegistryError, AppError) as exc:
+            deployment.registry_error = str(exc)[:512]
+            logger.warning(
+                "litellm_register_failed",
+                deployment_id=str(deployment.id),
+                model=catalog.upstream_name,
+                error_type=type(exc).__name__,
+            )
+            return False
+        deployment.registry_synced_at = self.clock.now()
+        deployment.registry_error = None
+        return True
+
+    async def _drop_deployment(self, deployment: ModelDeployment) -> None:
+        if not self.registry.configured:
+            return
+        try:
+            await self.registry.remove(str(deployment.id))
+        except RegistryError as exc:
+            deployment.registry_error = str(exc)[:512]
+            logger.warning("litellm_unregister_failed", deployment_id=str(deployment.id))
+            return
+        deployment.registry_synced_at = self.clock.now()
+        deployment.registry_error = None
+
+    async def _push_provider(self, provider_id: UUID) -> int:
+        """凭证轮换后把该供应商下所有 active 部署重推一遍。"""
+        if not self.registry.configured:
+            return 0
+        provider = await self._provider(provider_id)
+        try:
+            secret = await self._secret(provider.id)
+        except AppError:
+            return 0
+        result = await self.session.execute(
+            select(ModelDeployment, ModelCatalog)
+            .join(ModelCatalog, ModelCatalog.id == ModelDeployment.model_id)
+            .where(ModelDeployment.provider_id == provider_id, ModelDeployment.status == "active")
+        )
+        pushed = 0
+        for deployment, catalog in result.all():
+            if catalog.status != "published":
+                continue
+            if await self._push_deployment(deployment, catalog, provider, secret=secret):
+                pushed += 1
+        return pushed
+
+    async def reconcile_registry(self, limit: int = 200) -> dict[str, int]:
+        """对账：补齐未同步/同步失败的部署，并清理已停用但仍在 LiteLLM 的记录。"""
+        if not self.registry.configured:
+            return {"pushed": 0, "removed": 0, "failed": 0}
+        pending = await self.session.execute(
+            select(ModelDeployment, ModelCatalog, Provider)
+            .join(ModelCatalog, ModelCatalog.id == ModelDeployment.model_id)
+            .join(Provider, Provider.id == ModelDeployment.provider_id)
+            .where(
+                ModelDeployment.status == "active",
+                ModelCatalog.status == "published",
+                ModelDeployment.registry_synced_at.is_(None),
+            )
+            .limit(limit)
+        )
+        pushed = 0
+        failed = 0
+        secrets: dict[UUID, str] = {}
+        for deployment, catalog, provider in pending.all():
+            if provider.id not in secrets:
+                try:
+                    secrets[provider.id] = await self._secret(provider.id)
+                except AppError:
+                    failed += 1
+                    deployment.registry_error = "供应商没有可用凭证"
+                    continue
+            if await self._push_deployment(deployment, catalog, provider, secret=secrets[provider.id]):
+                pushed += 1
+            else:
+                failed += 1
+        removed = 0
+        try:
+            remote = await self.registry.list_ids()
+        except RegistryError:
+            return {"pushed": pushed, "removed": 0, "failed": failed}
+        if remote:
+            rows = await self.session.execute(
+                select(ModelDeployment).where(ModelDeployment.status == "disabled")
+            )
+            for row in rows.scalars().all():
+                if str(row.id) in remote:
+                    await self._drop_deployment(row)
+                    removed += 1
+        return {"pushed": pushed, "removed": removed, "failed": failed}
+
     async def _secret(self, provider_id: UUID) -> str:
         result = await self.session.execute(
             select(ProviderCredential).where(
@@ -765,7 +899,12 @@ class ProviderService:
         row = result.scalar_one_or_none()
         if row is None:
             raise AppError(400, "PROVIDER_NO_CREDENTIAL")
-        row.last_used_at = self.clock.now()
+        # 凭证行同样是热点：探测/同步/注册都会读它，60 秒写一次即可。
+        # SQLite/部分驱动返回 naive datetime，必须先归一到 UTC 再比较。
+        now = self.clock.now()
+        last_used = as_utc(row.last_used_at) if row.last_used_at is not None else None
+        if last_used is None or (now - last_used).total_seconds() >= 60:
+            row.last_used_at = now
         return decrypt_text(
             self.settings.encryption_master_key,
             row.secret_ciphertext,

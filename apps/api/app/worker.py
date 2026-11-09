@@ -14,6 +14,7 @@ from datetime import datetime
 import structlog
 from arq import cron
 from arq.connections import RedisSettings
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from app.admin.audit import verify_chain
@@ -24,6 +25,8 @@ from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.payments.gateways import StripeGateway, UsdtGateway
 from app.payments.service import PaymentService
+from app.providers.service import ProviderService
+from app.security.ssrf import default_resolver
 
 logger = structlog.get_logger("forgeapi.worker")
 
@@ -117,6 +120,30 @@ async def close_expired_payments(ctx: dict[str, object]) -> int:
             await owned.dispose()
 
 
+async def reconcile_litellm_registry(ctx: dict[str, object]) -> dict[str, int]:
+    """对账执行面：补齐未注册/注册失败的模型，清理已下架仍在 LiteLLM 的记录。
+
+    上架时的同步是「尽力而为」，LiteLLM 抖动会留下注册空洞；没有这一步，
+    用户会看到「后台已上架、调用 404/400」，而运维无从发现。
+    """
+
+    settings = get_settings()
+    maker, owned = await _sessionmaker(ctx)
+    try:
+        async with maker() as session:
+            service = ProviderService(
+                session, _clock(ctx), settings, default_resolver, None
+            )
+            result = await service.reconcile_registry()
+            await session.commit()
+            if result.get("pushed") or result.get("removed") or result.get("failed"):
+                logger.info("litellm_registry_reconciled", **result)
+            return result
+    finally:
+        if owned is not None:
+            await owned.dispose()
+
+
 async def close_stale_usage(ctx: dict[str, object]) -> int:
     """兜底结清：长期停在 pending 的用量记录释放预扣并落 released。
 
@@ -153,6 +180,65 @@ class _NullCache:
 
     async def delete(self, key: str) -> None:  # noqa: ARG002
         return None
+
+
+# LiteLLM 自己的日志表：`spend_logs`/`request_logs` 增长很快，长期不清会拖慢
+# 整个 PG 实例（与业务库同实例）。表名与时间列按 LiteLLM 的默认命名，
+# 找不到表或列时直接跳过，不报错。
+LOG_TABLES: tuple[tuple[str, str], ...] = (
+    ("LiteLLM_SpendLogs", "startTime"),
+    ("LiteLLM_RequestLogs", "updated_at"),
+)
+PURGE_BATCH = 5000
+PURGE_ROUNDS = 20
+
+
+async def purge_litellm_logs(ctx: dict[str, object]) -> int:
+    """按保留期清理 LiteLLM 日志表。分批删除，避免长事务锁表。"""
+
+    settings = get_settings()
+    if not settings.litellm_database_url:
+        return 0
+    engine = create_async_engine(settings.litellm_database_url, pool_pre_ping=True)
+    total = 0
+    try:
+        async with engine.begin() as conn:
+            for table, column in LOG_TABLES:
+                exists = await conn.scalar(
+                    text("SELECT to_regclass(:name)"), {"name": f'public."{table}"'}
+                )
+                if exists is None:
+                    continue
+                has_column = await conn.scalar(
+                    text(
+                        "SELECT count(*) FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = :table AND column_name = :column"
+                    ),
+                    {"table": table, "column": column},
+                )
+                if not has_column:
+                    continue
+                # 表名与列名来自上面的常量元组，不含外部输入。
+                statement = text(
+                    f'DELETE FROM "{table}" WHERE ctid IN ('
+                    f'SELECT ctid FROM "{table}" '
+                    f'WHERE "{column}" < now() - make_interval(days => :days) '
+                    f"LIMIT {PURGE_BATCH})"
+                )
+                for _ in range(PURGE_ROUNDS):
+                    result = await conn.execute(
+                        statement, {"days": settings.litellm_log_retention_days}
+                    )
+                    removed = result.rowcount or 0
+                    if removed <= 0:
+                        break
+                    total += removed
+    finally:
+        await engine.dispose()
+    if total:
+        logger.info("litellm_logs_purged", rows=total)
+    _ = ctx
+    return total
 
 
 async def verify_audit_chain(ctx: dict[str, object]) -> dict[str, object]:
@@ -196,6 +282,8 @@ class WorkerSettings:
         release_expired_holds,
         close_expired_payments,
         close_stale_usage,
+        reconcile_litellm_registry,
+        purge_litellm_logs,
         verify_audit_chain,
     ]
     # 关键：没有 cron_jobs 时 arq 只做「消费队列」，上面这些任务永远不会被触发。
@@ -203,6 +291,8 @@ class WorkerSettings:
         cron(release_expired_holds, second={0, 15, 30, 45}, run_at_startup=True),
         cron(close_expired_payments, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
         cron(close_stale_usage, minute={2, 12, 22, 32, 42, 52}),
+        cron(reconcile_litellm_registry, minute={6, 16, 26, 36, 46, 56}, run_at_startup=True),
+        cron(purge_litellm_logs, hour={4}, minute={20}),
         cron(verify_audit_chain, hour={3}, minute={10}),
     ]
     on_startup = startup

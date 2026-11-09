@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlparse
 from uuid import UUID
 
 import asyncpg
+from cryptography.fernet import Fernet
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -297,7 +298,8 @@ def _is_postgres_url(database_url: str) -> bool:
 
 def _list_backup_files() -> list[dict[str, object]]:
     files: list[dict[str, object]] = []
-    for pattern in ("*.dump", "*.sql"):
+    # `.enc` 是加密后的备份；列出它，运维才能确认「到底有没有加密落盘」。
+    for pattern in ("*.dump", "*.sql", "*.enc"):
         for path in _BACKUP_ROOT.glob(pattern):
             if not path.is_file():
                 continue
@@ -531,6 +533,8 @@ async def _backup_with_sql(
 async def create_backup(database_url: str, settings: Settings | None = None) -> dict[str, object]:
     host, port, user, password, database = _parse_db(database_url)
     _BACKUP_ROOT.mkdir(exist_ok=True)
+    # 先校验密钥再导出：密钥配错时不该先落一个明文文件在磁盘上。
+    sealed = _backup_fernet(settings)
     stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     binary = resolve_pg_dump(settings)
     method = "pg_dump"
@@ -555,17 +559,42 @@ async def create_backup(database_url: str, settings: Settings | None = None) -> 
     if not target.is_file() or target.stat().st_size <= 0:
         target.unlink(missing_ok=True)
         raise AppError(503, "BACKUP_EMPTY_FILE")
+    if sealed is not None:
+        target = await asyncio.to_thread(_seal, target, sealed)
     return {
         "name": target.name,
         "bytes": target.stat().st_size,
         "method": method,
+        "encrypted": sealed is not None,
         "modified_at": datetime.fromtimestamp(target.stat().st_mtime, tz=UTC).isoformat(),
     }
 
 
+def _backup_fernet(settings: Settings | None) -> Fernet | None:
+    if settings is None or not settings.backup_encryption_key:
+        return None
+    try:
+        return Fernet(settings.backup_encryption_key.encode())
+    except (ValueError, TypeError) as exc:
+        raise AppError(503, "BACKUP_ENCRYPTION_KEY_INVALID") from exc
+
+
+def _seal(source: Path, key: Fernet) -> Path:
+    """加密后删除明文。
+
+    Fernet 需要一次性拿到完整明文，因此这里整体读入内存。几十 MB 的业务库没问题；
+    若库大到 GB 级，应改用 `age`/`gpg` 这类流式方案，而不是加大内存。
+    """
+    sealed = source.with_name(source.name + ".enc")
+    sealed.write_bytes(key.encrypt(source.read_bytes()))
+    source.unlink(missing_ok=True)
+    return sealed
+
+
 def delete_backup(name: str) -> dict[str, object]:
     cleaned = Path(name).name
-    if cleaned != name or ".." in cleaned or not (cleaned.endswith(".dump") or cleaned.endswith(".sql")):
+    allowed = (".dump", ".sql", ".dump.enc", ".sql.enc")
+    if cleaned != name or ".." in cleaned or not cleaned.endswith(allowed):
         raise AppError(400, "BACKUP_NAME_INVALID")
     target = _BACKUP_ROOT / cleaned
     if not target.is_file():

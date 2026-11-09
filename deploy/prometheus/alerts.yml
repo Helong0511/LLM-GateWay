@@ -1,0 +1,87 @@
+# Prometheus 告警规则（配合 apps/api 的 /metrics）。
+#
+# 抓取配置示例：
+#   scrape_configs:
+#     - job_name: forge-api
+#       metrics_path: /metrics
+#       authorization:
+#         credentials: <METRICS_TOKEN>   # 与 api 的 METRICS_TOKEN 一致
+#       static_configs:
+#         - targets: ["api:8000"]
+#
+# 关键点：/metrics 只应暴露在内网。nginx 目前把 / 转发给 web，不会代理 /metrics，
+# 因此公网访问不到；若要经 nginx 抓取，请单独加 location 并限制来源网段。
+
+groups:
+  - name: forge-api
+    rules:
+      - alert: ForgeApiDown
+        expr: up{job="forge-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ForgeAPI 实例不可抓取"
+          description: "{{ $labels.instance }} 已连续 2 分钟无法抓取，检查进程与数据库/Redis 连通性。"
+
+      - alert: ForgeHigh5xxRate
+        expr: |
+          sum(rate(forge_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(forge_http_requests_total[5m])), 0.001) > 0.02
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "5xx 比例超过 2%"
+          description: "最近 5 分钟 5xx 占比 {{ $value | humanizePercentage }}，先看 forge_api_errors_total 的错误码分布。"
+
+      - alert: ForgeUpstreamErrors
+        expr: |
+          sum(rate(forge_api_errors_total{
+            code=~"UPSTREAM_ERROR|GATEWAY_UPSTREAM_UNREACHABLE|DEPENDENCY_UNAVAILABLE"
+          }[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "上游/LiteLLM 持续报错"
+          description: "每秒超过 1 次上游失败，检查 LiteLLM 与 Provider 连通性、以及 registry_error。"
+
+      - alert: ForgeRegistrySyncFailing
+        expr: forge_model_registry_errors > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "有模型未成功注册到 LiteLLM"
+          description: "{{ $value }} 个 deployment 的 registry_error 非空。上架成功但调用 404 就是这个原因，对账任务每 10 分钟会重试。"
+
+      - alert: ForgeBalanceHoldsBacklog
+        expr: forge_balance_holds_pending > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "预扣堆积"
+          description: "{{ $value }} 笔预扣仍未结清（金额 {{ $value }}），通常意味着上游超时后未走结算路径；检查 release_expired_holds 是否在跑。"
+
+      - alert: ForgeUsagePendingBacklog
+        expr: forge_usage_pending > 200
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "结算长期 pending"
+          description: "{{ $value }} 条 usage 停在 pending，账面收入会失真；确认 close_stale_usage cron 正常。"
+
+      - alert: ForgeLatencyP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(forge_http_request_duration_seconds_bucket{route!~"/v1/.*"}[5m])) by (le)
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "非流式接口 P95 超过 2 秒"
+          description: "当前 P95 = {{ $value }}s。流式接口（/v1）耗时为整条 SSE 的持续时间，故意排除在延迟告警之外。"

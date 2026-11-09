@@ -43,6 +43,9 @@ jobs:
       - name: lint
         working-directory: apps/web
         run: pnpm lint
+      - name: 依赖漏洞审计
+        working-directory: apps/web
+        run: pnpm audit --prod --audit-level high
       - name: vitest
         working-directory: apps/web
         run: pnpm test

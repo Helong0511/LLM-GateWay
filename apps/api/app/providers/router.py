@@ -15,6 +15,7 @@ from app.billing.money import format_money
 from app.core.errors import success
 from app.db.models.auth import User
 from app.db.session import get_db
+from app.providers.litellm_registry import LiteLLMRegistry
 from app.providers.service import ProviderService
 from app.security.ssrf import default_resolver
 
@@ -81,8 +82,18 @@ def _service(request: Request, db: AsyncSession) -> ProviderService:
     transport = getattr(request.app.state, "upstream_transport", None)
     if not isinstance(transport, httpx.AsyncBaseTransport):
         transport = None
+    registry_transport = getattr(request.app.state, "litellm_transport", None)
+    if not isinstance(registry_transport, httpx.AsyncBaseTransport):
+        registry_transport = None
+    registry = LiteLLMRegistry(request.app.state.settings, transport=registry_transport)
     return ProviderService(
-        db, request.app.state.clock, request.app.state.settings, resolver, transport, upstream_client=client
+        db,
+        request.app.state.clock,
+        request.app.state.settings,
+        resolver,
+        transport,
+        upstream_client=client,
+        registry=registry,
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from uuid import uuid4
 
 import structlog
@@ -10,6 +11,13 @@ from starlette.requests import Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.core.errors import failure
+from app.core.metrics import (
+    HTTP_DURATION,
+    HTTP_INFLIGHT,
+    HTTP_REQUESTS,
+    REGISTRY,
+    route_label,
+)
 
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
 
@@ -51,12 +59,29 @@ class RequestContextMiddleware:
             state["request_id"] = request_id
         structlog.contextvars.bind_contextvars(request_id=request_id)
 
+        method = scope.get("method", "GET")
+        route = route_label(scope.get("path", ""))
+        started_at = time.perf_counter()
+        REGISTRY.add_gauge(HTTP_INFLIGHT, 1.0)
+
+        def record(status: int | None) -> None:
+            REGISTRY.add_gauge(HTTP_INFLIGHT, -1.0)
+            if status is None:
+                return
+            REGISTRY.counter(
+                HTTP_REQUESTS, {"method": method, "route": route, "status": str(status)}
+            )
+            REGISTRY.observe(
+                HTTP_DURATION, time.perf_counter() - started_at, {"method": method, "route": route}
+            )
+
         content_length = headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > self.max_body_bytes:
             request = Request(scope)
             response = failure(
                 request, 413, "PAYLOAD_TOO_LARGE", f"请求体超过 {self.max_body_bytes} 字节限制"
             )
+            record(413)
             await response(scope, receive, send)
             structlog.contextvars.clear_contextvars()
             return
@@ -64,6 +89,7 @@ class RequestContextMiddleware:
         # Content-Length 可以被省略（chunked），因此必须在读取过程中累计字节数。
         received = 0
         started = False
+        status_code: int | None = None
         # 不能在 receive() 里抛异常：FastAPI 会把 body 读取阶段的任意异常
         # 兜底成 HTTPException(400)，超限信号会被吞掉，chunked 请求因此绕过上限。
         # 改为「截断输入 + 丢弃应用响应 + 自回 413」。
@@ -80,11 +106,12 @@ class RequestContextMiddleware:
             return message
 
         async def send_with_id(message: Message) -> None:
-            nonlocal started
+            nonlocal started, status_code
             if too_large:
                 return  # 应用对截断输入的响应一律丢弃，由下面统一回 413
             if message["type"] == "http.response.start":
                 started = True
+                status_code = int(message.get("status", 0)) or None
                 raw_headers = list(message.get("headers", []))
                 raw_headers.append((b"x-request-id", request_id.encode("ascii")))
                 raw_headers.extend(
@@ -121,5 +148,7 @@ class RequestContextMiddleware:
                 response = failure(
                     request, 413, "PAYLOAD_TOO_LARGE", f"请求体超过 {self.max_body_bytes} 字节限制"
                 )
+                status_code = 413
                 await response(scope, receive, send)
+            record(status_code)
             structlog.contextvars.clear_contextvars()

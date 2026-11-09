@@ -78,6 +78,17 @@ def _upstream(captured: list[str]) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
+def _registry(calls: list[tuple[str, dict[str, object]]]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content or b"{}")
+        calls.append((request.url.path, body))
+        if request.url.path.endswith("/model/info"):
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(200, json={})
+
+    return httpx.MockTransport(handler)
+
+
 @pytest.fixture
 async def api(tmp_path: Path) -> AsyncIterator[tuple[AsyncClient, object, list[str]]]:
     from httpx import ASGITransport, AsyncClient
@@ -100,6 +111,9 @@ async def api(tmp_path: Path) -> AsyncIterator[tuple[AsyncClient, object, list[s
     app.state.clock = ManualClock()
     app.state.ssrf_resolver = _resolver
     app.state.upstream_transport = _upstream(captured)
+    # LiteLLM 执行面替身：记录 /model/new、/model/delete，避免测试真连 4000 端口。
+    app.state.registry_calls = []
+    app.state.litellm_transport = _registry(app.state.registry_calls)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client, app, captured
@@ -310,3 +324,51 @@ async def test_tc_gw_stream_cancel_releases_slot_and_rate_limit(api: tuple[objec
 
 async def _always_disconnected() -> bool:
     return True
+
+
+@pytest.mark.asyncio
+async def test_publish_and_unpublish_sync_to_litellm(api: tuple[object, object, list[str]]) -> None:
+    """上架必须把 deployment 注册进 LiteLLM，下架必须撤销。
+
+    否则管理后台显示「已上架」，真实 /v1 调用却是 model not found。
+    """
+    client, app, _captured = api
+    await _login(client, app, "registry@example.com")
+    await _grant_model_ops(app, "registry@example.com")
+    created = await client.post(  # type: ignore[attr-defined]
+        "/api/admin/providers",
+        json={"name": "同步上游", "kind": "openai", "base_url": "http://upstream.test"},
+    )
+    provider_id = created.json()["data"]["id"]
+    await client.post(  # type: ignore[attr-defined]
+        f"/api/admin/providers/{provider_id}/credentials",
+        json={"secret": UPSTREAM_SECRET},
+    )
+    await client.post(f"/api/admin/providers/{provider_id}/sync")  # type: ignore[attr-defined]
+    model_id = (await client.get("/api/admin/models")).json()["data"]["models"][0]["id"]  # type: ignore[attr-defined]
+
+    published = await client.post(  # type: ignore[attr-defined]
+        f"/api/admin/models/{model_id}/publish",
+        json={"display_name": "同步模型", "supports_stream": True, "supports_embeddings": False},
+    )
+    assert published.status_code == 200, published.text
+
+    calls: list[tuple[str, dict[str, object]]] = app.state.registry_calls  # type: ignore[attr-defined]
+    registered = [body for path, body in calls if path.endswith("/model/new")]
+    assert registered, "上架没有调用 LiteLLM /model/new"
+    payload = registered[-1]
+    assert payload["model_name"] == "mock-model"
+    params = payload["litellm_params"]
+    assert isinstance(params, dict)
+    assert params["model"] == "openai/mock-model"
+    assert params["api_base"] == "http://upstream.test"
+    assert params["api_key"] == UPSTREAM_SECRET
+    info = payload["model_info"]
+    assert isinstance(info, dict) and info["id"]
+
+    unpublished = await client.post(  # type: ignore[attr-defined]
+        "/api/admin/models/unpublish-batch", json={"model_ids": [model_id]}
+    )
+    assert unpublished.status_code == 200, unpublished.text
+    removed = [body for path, body in calls if path.endswith("/model/delete")]
+    assert removed and removed[-1]["id"] == info["id"]

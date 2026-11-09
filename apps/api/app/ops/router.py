@@ -15,9 +15,10 @@ from app.auth.deps import (
     require_permission,
 )
 from app.auth.repository import AuthRepository
-from app.core.errors import success
+from app.core.errors import AppError, success
 from app.db.models.auth import User
 from app.db.session import get_db
+from app.ops.ledger_audit import reconcile
 from app.ops.platform import (
     content_view,
     create_backup,
@@ -464,3 +465,23 @@ async def remove_backup(
     _: User = Depends(require_permission("admin:access")),
 ) -> dict[str, object]:
     return success(request, delete_backup(name))
+
+
+@router.get("/api/admin/ledger/reconcile")
+async def ledger_reconcile(
+    request: Request,
+    apply: bool = Query(default=False),
+    user: User = Depends(require_permission("admin:access")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, object]:
+    """按流水重算余额快照。
+
+    `apply=false` 是只读比对，任何有 `admin:access` 的人都能看；
+    `apply=true` 会改余额，必须有 `ledger:adjust`（默认只给 superadmin）。
+    """
+    if apply:
+        granted = await AuthRepository(db).permission_codes(user.id)
+        if "ledger:adjust" not in granted:
+            raise AppError(403, "FORBIDDEN")
+    data = await reconcile(db, request.app.state.clock, apply=apply)
+    return success(request, data)

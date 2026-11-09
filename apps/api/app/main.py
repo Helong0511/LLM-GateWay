@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
+import structlog
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
@@ -48,6 +49,12 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings)
+    if settings.app_env == "production" and not settings.backup_encryption_key:
+        # 不阻断启动：已有部署可能先跑起来再补密钥；但这属于必须修的安全缺口。
+        structlog.get_logger("forgeapi").warning(
+            "backup_encryption_disabled",
+            hint="设置 BACKUP_ENCRYPTION_KEY（Fernet key），否则备份文件是明文",
+        )
 
     docs_url = None if settings.app_env == "production" else "/docs"
     redoc_url = None if settings.app_env == "production" else "/redoc"
@@ -55,12 +62,18 @@ def create_app(
 
     engine: AsyncEngine | None = None
     redis: Redis | None = None
+    limit_redis: Redis | None = None
     sessionmaker: async_sessionmaker[AsyncSession] | None = None
     if probes is None:
         engine = create_async_engine(
-            settings.database_url, pool_pre_ping=True, pool_size=5, max_overflow=10
+            settings.database_url,
+            pool_pre_ping=True,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
         )
         redis = Redis.from_url(settings.redis_url)
+        # 限流/并发闸独立连接：与 arq 队列分库，避免缓存淘汰误伤待执行任务。
+        limit_redis = Redis.from_url(settings.redis_rate_limit_url)
         probes = DefaultProbes(engine, redis)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -80,6 +93,8 @@ def create_app(
             await engine.dispose()
         if redis is not None:
             await redis.aclose()
+        if limit_redis is not None:
+            await limit_redis.aclose()
 
     app = FastAPI(
         title="ForgeAPI",
@@ -98,9 +113,10 @@ def create_app(
     app.state.email_sender = build_email_sender(settings)
     app.state.key_cache = MemoryKeyCache(app.state.clock)
     # 限流与并发闸优先走 Redis：多副本时才能得到全局限额。
-    if redis is not None:
-        app.state.rate_limiter = RedisRateLimiter(redis)
-        app.state.slots = RedisSlots(redis)
+    if limit_redis is not None:
+        app.state.rate_limit_redis = limit_redis
+        app.state.rate_limiter = RedisRateLimiter(limit_redis)
+        app.state.slots = RedisSlots(limit_redis)
     else:
         app.state.rate_limiter = MemoryRateLimiter()
         app.state.slots = MemorySlots()

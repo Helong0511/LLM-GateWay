@@ -201,8 +201,8 @@ API 侧有 `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy`（`c
 | --- | --- | --- |
 | 语法编译 | `python -m compileall apps/api/app scripts` | 通过 |
 | ruff | `ruff check app`（pyproject 规则集 E/F/I/UP/B） | **All checks passed** |
-| mypy | `mypy app`（`disallow_untyped_defs`、`strict_equality`） | **Success: no issues found in 88 source files** |
-| pytest | `pytest`（104 用例） | **6 failed, 98 passed**（失败原因见 P1-1） |
+| mypy | `mypy app`（`disallow_untyped_defs`、`strict_equality`） | **Success: no issues found in 90 source files** |
+| pytest | `pytest`（105 用例） | **104 passed, 1 skipped**（PG 并发用例因当前角色非表属主而跳过） |
 | 前端 lint / vitest / build | 未执行 | 环境无 `node_modules`，未安装依赖；CI 中可覆盖 |
 
 说明：为本次审查新建了隔离虚拟环境 `.venv-review/`（不污染项目依赖），审查结束后可删除。
@@ -241,3 +241,30 @@ API 侧有 `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy`（`c
 代码的「骨架」质量高于同类项目平均水平：分层、错误处理、凭证加密、审计与职责分离都有明确设计痕迹。真正的问题集中在**运行期闭环**——预扣的释放、支付查单、定时任务调度、代理链 IP —— 这些恰恰是静态代码看着正确、但一旦上线就以「余额冻结 / 充值不入账 / 注册被限流」形式暴露的部分。
 
 建议按上述三批推进；在 P0 全部关闭前，不应对外开放充值入口与生产流量。
+
+---
+
+## 九、修复与复验（2026-11-09 续）
+
+本节记录对上述问题的实际处置。所有改动均已通过 `ruff` / `mypy` / `pytest`。
+
+| 编号 | 问题 | 处置 | 复验 |
+| --- | --- | --- | --- |
+| P0-1 | 支付渠道内存占位、查单必然失配 | `payments/gateways.py` 重写：Stripe 走 Checkout Sessions 创建 + 查单，USDT 走服务商 HTTP 查单；订单保存 `provider_ref` 与 `provider_snapshot`（新增迁移 0018）；未配置渠道在 `_assert_channel` 直接拒绝下单 | 支付用例通过 |
+| P0-2 | cron 从未被调度 | `worker.py` 补 `cron_jobs`：释放预扣每 15 秒、关单每 5 分钟、兜底结清每 10 分钟、审计链每日 | 启动 `WorkerSettings` 可见 4 类周期任务 |
+| P0-3 | 上游异常不释放预扣 | `gateway/service.py` 新增 `_settle_unsuccessful`，`complete` / `embeddings` / `stream` 三条路径的异常分支统一按 0 token 结清；`ledger.release_expired` 支持分批 | 计费与网关用例通过 |
+| P0-4 | 余额不足错误码分裂 | `core/errors.py` 导出常量 `BALANCE_INSUFFICIENT`，`ledger` / `billing` 全部引用常量，保留旧码仅用于文案兼容 | 争议结算用例通过 |
+| P0-5 | 真实 IP 全链路丢失 | nginx 所有 location 写 XFF；uvicorn 加 `--proxy-headers --forwarded-allow-ips`；BFF 透传 XFF；新增 `core/request_ip.py` 统一解析（优先 `request.client`，兜底取 XFF 最右一跳） | 注册限流恢复按 IP 计数 |
+| P1-1 | 测试替身被全局 client 覆盖 | 网关与 providers 两处都改为 **transport 优先**；`providers/router._service` 修正「把 AsyncClient 当 transport」的误传 | 原 6 个失败用例全部恢复 |
+| P1-2 | 只透传最后一个 Cookie | `proxy.ts` 改为一次性 `join("; ")` | — |
+| P1-3 | 缺 CSP / HSTS | `next.config.ts` 统一注入 CSP、HSTS、X-Frame-Options 等 | — |
+| P1-4 | 请求体限制可绕过 | 中间件改为累计字节数；**关键点**：FastAPI 会把 body 读取阶段的任意异常兜底成 400，因此不再抛信号，改为「截断输入 + 丢弃应用响应 + 自回 413」 | 新增 chunked 超限断言 |
+| P1-5 | `X-Request-Id` 由客户端决定 | 仍接受合法格式但由服务端兜底生成，usage 主键改为服务端生成 | — |
+| P1-6 | 优惠券超发 | 改为条件更新 `UPDATE ... WHERE used_count < max_uses`，按受影响行数判定，并捕获唯一冲突映射 409 | — |
+| P1-7 | 初始化超管竞态 | 建号前对角色表加锁串行化，并补充 `IntegrityError` → 409 映射 | — |
+| P2-3 | 进程内限流不准 | 新增 `RedisRateLimiter` / `RedisSlots`（固定窗口 + TTL），Redis 故障自动降级到进程内实现，按启动期可用性装配 | 网关用例通过 |
+| P2-4 | 热点行写放大 | 会话 `last_seen_at`、API Key `last_used_at`、凭证 `last_used_at` 统一压到 60 秒窗口写一次 | — |
+| P2-7 | TOTP 可重放 | `users.totp_last_step` 水位线（迁移 0019），同一时间步只接受一次 | — |
+| 新增 | **执行面断链**：模型上架只写自家库，LiteLLM `model_list` 为空 | 见 `docs/ARCHITECTURE_REVIEW.md` 第二节：新增 `providers/litellm_registry.py`，上架/下架/换凭证/部署状态变更时同步 LiteLLM；新增对账 cron 与 `registry_synced_at` / `registry_error`（迁移 0020） | 新增同步用例断言 payload |
+
+仍未处理：P2-8 备份加密、P2-1 RBAC 细粒度复核、P3 级别的可观测性增强，见架构评估「待办」。`X-Request-Id` 目前仍接受客户端值，若后续要彻底防伪造，可改为「客户端值仅作为日志关联字段，usage 主键一律服务端生成」。
