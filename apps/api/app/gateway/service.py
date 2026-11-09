@@ -20,7 +20,7 @@ from app.core.config import Settings
 from app.core.errors import AppError
 from app.db.models.auth import User
 from app.db.models.providers import ModelCatalog, ModelDeployment
-from app.gateway.limit import MemoryRateLimiter, MemorySlots
+from app.gateway.limit import RateLimiter, Slots
 from app.keys.cache import KeyCache
 from app.keys.entitlements import effective_allowed_models
 from app.keys.service import KeyService
@@ -57,8 +57,8 @@ class GatewayService:
         clock: Clock,
         settings: Settings,
         cache: KeyCache,
-        limiter: MemoryRateLimiter,
-        slots: MemorySlots,
+        limiter: RateLimiter,
+        slots: Slots,
         transport: httpx.AsyncBaseTransport | None,
         *,
         upstream_client: httpx.AsyncClient | None = None,
@@ -94,14 +94,14 @@ class GatewayService:
         if require_embeddings and catalog.supports_embeddings is not True:
             raise AppError(404, "GATEWAY_EMBEDDINGS_UNSUPPORTED")
         estimate = _estimate(body)
-        if not self.limiter.allow(self.clock, f"rpm:{row.id}", row.rpm_limit):
+        if not await self.limiter.allow(self.clock, f"rpm:{row.id}", row.rpm_limit):
             await self._record_failure(user.id, row.id, request_id, model_name, 429, "rate_limited")
             raise AppError(429, "GATEWAY_RPM_LIMIT")
-        if not self.limiter.allow(self.clock, f"tpm:{row.id}", row.tpm_limit, cost=estimate):
+        if not await self.limiter.allow(self.clock, f"tpm:{row.id}", row.tpm_limit, cost=estimate):
             await self._record_failure(user.id, row.id, request_id, model_name, 429, "rate_limited")
             raise AppError(429, "GATEWAY_TPM_LIMIT")
         slot_key = str(row.id)
-        if not self.slots.acquire(slot_key, row.max_concurrency):
+        if not await self.slots.acquire(slot_key, row.max_concurrency):
             await self._record_failure(
                 user.id, row.id, request_id, model_name, 429, "concurrency_limited"
             )
@@ -120,7 +120,7 @@ class GatewayService:
                 now=self.clock.now(),
             )
         except Exception:
-            self.slots.release(slot_key, row.max_concurrency)
+            await self.slots.release(slot_key, row.max_concurrency)
             raise
         try:
             await self._billing().reserve(
@@ -132,7 +132,7 @@ class GatewayService:
                 output_tokens=0 if require_embeddings else _reserve_output(body),
             )
         except AppError as exc:
-            self.slots.release(slot_key, row.max_concurrency)
+            await self.slots.release(slot_key, row.max_concurrency)
             if exc.status_code == 402:
                 await self.keys.finalize_usage(
                     request_id,
@@ -146,7 +146,7 @@ class GatewayService:
                 )
             raise
         except Exception:
-            self.slots.release(slot_key, row.max_concurrency)
+            await self.slots.release(slot_key, row.max_concurrency)
             raise
         payload = dict(body)
         payload["model"] = catalog.upstream_name
@@ -229,7 +229,7 @@ class GatewayService:
             )
             raise AppError(502, "GATEWAY_UPSTREAM_UNREADABLE")
         finally:
-            self.slots.release(prepared.slot_key, prepared.concurrency_limit)
+            await self.slots.release(prepared.slot_key, prepared.concurrency_limit)
 
     async def stream(
         self,
@@ -283,7 +283,7 @@ class GatewayService:
             finish = "error"
             raise
         finally:
-            self.slots.release(prepared.slot_key, prepared.concurrency_limit)
+            await self.slots.release(prepared.slot_key, prepared.concurrency_limit)
             source = "reported"
             prompt = completion = 0
             cached = 0
@@ -371,7 +371,7 @@ class GatewayService:
                 raise AppError(502, "GATEWAY_UPSTREAM_UNREADABLE")
             return payload
         finally:
-            self.slots.release(prepared.slot_key, prepared.concurrency_limit)
+            await self.slots.release(prepared.slot_key, prepared.concurrency_limit)
 
     async def _published(self, public_name: str) -> ModelCatalog:
         row = await self.session.scalar(select(ModelCatalog).where(ModelCatalog.public_name == public_name))

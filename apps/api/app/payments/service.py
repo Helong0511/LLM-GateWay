@@ -707,6 +707,12 @@ class PaymentService:
             raise AppError(503, "CHANNEL_NOT_CONFIGURED", details={"channel": channel})
         if channel not in {"stripe", "usdt"}:
             raise AppError(400, "CHANNEL_UNSUPPORTED", details={"channel": channel})
+        # 渠道未接入时，生产环境直接拒绝下单；不再留一个「回调必然失败」的入口。
+        # 开发/测试环境（mock 打开）允许走内存沙箱。
+        if not self.settings.mock_payments_enabled:
+            gateway = self.stripe if channel == "stripe" else self.usdt
+            if not gateway.configured:
+                raise AppError(503, "CHANNEL_NOT_CONFIGURED", details={"channel": channel})
 
     async def _replay(self, user_id: UUID, key: str, digest: str) -> dict[str, object] | None:
         result = await self.session.execute(
@@ -801,6 +807,7 @@ class PaymentService:
             "crypto_currency": order.crypto_currency,
             "network": order.network,
             "pay_address": order.pay_address,
+            "checkout_url": order.checkout_url,
             "address_check": check if address else None,
             "payer_address": order.payer_address,
             "locked_rate": format_money(order.locked_rate) if order.locked_rate is not None else None,

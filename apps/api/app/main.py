@@ -28,7 +28,7 @@ from app.core.logging import configure_logging
 from app.core.middleware import RequestContextMiddleware
 from app.core.readiness import DefaultProbes, ReadinessProbes
 from app.crud_ext.router import router as crud_ext_router
-from app.gateway.limit import MemoryRateLimiter, MemorySlots
+from app.gateway.limit import MemoryRateLimiter, MemorySlots, RedisRateLimiter, RedisSlots
 from app.gateway.router import router as gateway_router
 from app.keys.cache import MemoryKeyCache
 from app.keys.router import router as keys_router
@@ -97,12 +97,17 @@ def create_app(
     app.state.clock = SystemClock()
     app.state.email_sender = build_email_sender(settings)
     app.state.key_cache = MemoryKeyCache(app.state.clock)
-    app.state.rate_limiter = MemoryRateLimiter()
-    app.state.slots = MemorySlots()
+    # 限流与并发闸优先走 Redis：多副本时才能得到全局限额。
+    if redis is not None:
+        app.state.rate_limiter = RedisRateLimiter(redis)
+        app.state.slots = RedisSlots(redis)
+    else:
+        app.state.rate_limiter = MemoryRateLimiter()
+        app.state.slots = MemorySlots()
     app.state.ssrf_resolver = default_resolver
     app.state.upstream_client = upstream_client
-    app.state.stripe_gateway = StripeGateway()
-    app.state.usdt_gateway = UsdtGateway()
+    app.state.stripe_gateway = StripeGateway(settings)
+    app.state.usdt_gateway = UsdtGateway(settings)
 
     app.add_middleware(
         CORSMiddleware,

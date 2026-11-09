@@ -262,7 +262,9 @@ class KeyService:
             raise AppError(403, "API_KEY_IP_DENIED")
         if row.budget_limit is not None and row.budget_spent >= row.budget_limit:
             raise AppError(402, "API_KEY_BUDGET_EXCEEDED")
-        row.last_used_at = now
+        # 每次调用都更新会让 api_keys 行成为热点；60 秒窗口写一次足够。
+        if row.last_used_at is None or (now - as_utc(row.last_used_at)).total_seconds() >= 60:
+            row.last_used_at = now
         await self.cache.set(key_hash, "active")
         return row
 

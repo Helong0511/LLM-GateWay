@@ -100,7 +100,13 @@ async def close_expired_payments(ctx: dict[str, object]) -> int:
     maker, owned = await _sessionmaker(ctx)
     try:
         async with maker() as session:
-            service = PaymentService(session, _clock(ctx), settings, StripeGateway(), UsdtGateway())
+            service = PaymentService(
+                session,
+                _clock(ctx),
+                settings,
+                StripeGateway(settings),
+                UsdtGateway(settings),
+            )
             count = await service.close_expired()
             await session.commit()
             if count:

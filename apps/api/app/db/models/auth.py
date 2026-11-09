@@ -42,6 +42,8 @@ class User(Base):
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     totp_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     totp_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    # 最近一次成功使用的时间步（30 秒一格），用于拒绝同一个 6 位码重复使用。
+    totp_last_step: Mapped[int | None] = mapped_column(Integer)
     terms_version: Mapped[str | None] = mapped_column(String(64))
     terms_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     privacy_version: Mapped[str | None] = mapped_column(String(64))

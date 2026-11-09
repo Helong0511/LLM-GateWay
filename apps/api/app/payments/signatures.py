@@ -11,21 +11,26 @@ from datetime import datetime
 def stripe_signature_ok(secret: str, payload: bytes, header: str, now: datetime, *, tolerance: int = 300) -> bool:
     if not header or not secret:
         return False
-    parts: dict[str, str] = {}
+    # 同一头里可能同时出现多个 v1（官方密钥轮换期），必须逐个比对而不是只取最后一个。
+    parts: dict[str, list[str]] = {}
     for item in header.split(","):
         if "=" not in item:
             continue
         key, value = item.split("=", 1)
-        parts[key.strip()] = value.strip()
-    timestamp = parts.get("t")
-    signature = parts.get("v1")
-    if timestamp is None or signature is None or not timestamp.isdigit():
+        parts.setdefault(key.strip(), []).append(value.strip())
+    timestamps = parts.get("t") or []
+    signatures = parts.get("v1") or []
+    if not timestamps or not signatures or not timestamps[0].isdigit():
         return False
+    timestamp = timestamps[0]
     if abs(int(now.timestamp()) - int(timestamp)) > tolerance:
         return False
     signed = timestamp.encode() + b"." + payload
     expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
+    matched = False
+    for signature in signatures:
+        matched |= hmac.compare_digest(expected, signature)
+    return matched
 
 
 def usdt_signature(secret: str, payload: bytes) -> str:

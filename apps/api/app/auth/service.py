@@ -564,7 +564,14 @@ class AuthService:
             user.totp_secret_encrypted,
             code="TOTP_DECRYPT_FAILED",
         )
-        if pyotp.TOTP(secret).verify(code, valid_window=1):
+        totp = pyotp.TOTP(secret)
+        if totp.verify(code, valid_window=1):
+            step = int(now.timestamp()) // totp.interval
+            # 同一个 6 位码在 ±30 秒窗口内可被重复提交（例如会话被截获后重放），
+            # 用时间步水位线拒绝「用过的码再用一次」。
+            if user.totp_last_step is not None and step <= user.totp_last_step:
+                return False
+            user.totp_last_step = step
             return True
         recovery = await self.repo.unused_recovery(user.id, digest(code))
         if recovery is None:

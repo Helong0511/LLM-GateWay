@@ -57,12 +57,16 @@ async def optional_session_row(request: Request, db: AsyncSession = Depends(get_
         row.revoked_at = now
         request.state.clear_session_cookie = True
         return None
-    row.last_seen_at = now
-    row.last_seen_ip = client_ip(request) or row.last_seen_ip
-    # 滑动空闲续期，但不得超过绝对过期时间
-    idle = now + timedelta(hours=settings.session_idle_hours)
-    absolute = as_utc(row.absolute_expires_at)
-    row.idle_expires_at = idle if idle < absolute else absolute
+    # 读请求也会写 last_seen_at / idle_expires_at，同一会话多标签页并发 GET 时
+    # 这一行会成为行锁热点。压缩到 60 秒窗口写一次，语义上无感（闲置检测精度 1 分钟）。
+    last_seen = as_utc(row.last_seen_at) if row.last_seen_at is not None else None
+    if last_seen is None or (now - last_seen).total_seconds() >= 60:
+        row.last_seen_at = now
+        row.last_seen_ip = client_ip(request) or row.last_seen_ip
+        # 滑动空闲续期，但不得超过绝对过期时间
+        idle = now + timedelta(hours=settings.session_idle_hours)
+        absolute = as_utc(row.absolute_expires_at)
+        row.idle_expires_at = idle if idle < absolute else absolute
     return row
 
 
