@@ -80,8 +80,9 @@
 - 缓存希望 `allkeys-lru`；
 - 队列**绝不能**被淘汰，否则任务丢失。
 
-**建议**：物理分实例，或至少 `SELECT` 不同 db（缓存 db1、队列 db0），队列所在实例禁用淘汰策略
-（`maxmemory-policy noeviction`）。当前代码里限流键有 `forge:rl:` / `forge:slot:` 前缀，迁移成本低。
+**已落地**：限流/并发闸改用独立连接（`REDIS_RATE_LIMIT_URL`，默认 db1），与 arq 队列（db0）分库，
+至少不会互相 FLUSH。**仍建议**：队列实例设 `maxmemory-policy noeviction`；若缓存与队列
+继续共享同一实例，淘汰策略仍会全局生效，规模上来后应物理分实例。
 
 ### 3.3 账本
 
@@ -93,13 +94,14 @@
 
 ### 4.1 uvicorn 单进程
 
-`Dockerfile` 的启动命令没有 `--workers`，即单进程。async I/O 场景下单进程能撑住相当并发，但：
+`Dockerfile` 现在默认 `--workers 2`，并把 `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` 暴露为环境变量
+（compose 按 2 workers 调到 3+5，总计 16 条连接，给 worker 与 LiteLLM 留足余量）。
 
-- CPU 密集（JSON 编解码、加密解密、账本计算）会串行；
-- 一个进程崩溃 = 全部请求中断；
-- 限流若退回进程内实现（Redis 故障），单进程反而是「准确」的，多进程则不准确。
+两点必须一起理解：
 
-**建议**：生产起 `--workers 2~4`，并把 `pool_size` 相应下调；同时确认 `RedisRateLimiter` 已生效（当前按 `redis` 可用性自动装配）。
+- 连接数是**按进程**计的，调 workers 必须同步调池大小，否则会打满 PG 的 `max_connections`；
+- 限流已走 Redis（`RedisRateLimiter`/`RedisSlots`），多进程下仍是全局限额；Redis 故障时会降级到
+  进程内实现，此时限额变成「每进程一份」，属于可接受的降级而非静默错误。
 
 ### 4.2 arq 与 cron
 
@@ -130,7 +132,7 @@
 | --- | --- | --- |
 | 客户端 IP | nginx 写 XFF → uvicorn `--proxy-headers` 改写 `scope["client"]` → 应用优先用它 | 链路完整；`--forwarded-allow-ips` 默认 `*`，依赖「api 端口不对外」这一前提，compose 里确实没映射端口，可接受但要写进部署检查清单 |
 | 上游凭证 | Fernet 派生密钥加密存库，响应只回 hint | 好；但 LiteLLM 侧会再存一份明文 `api_key`（由其自身加密策略决定），等于多一处副本 |
-| 备份 | `pg_dump` 产出明文文件 | **待办**：加 `age`/GPG 加密 + 保留期 + 异地存储 |
+| 备份 | `pg_dump` 产出，默认明文 | 已支持 `BACKUP_ENCRYPTION_KEY`（Fernet）：导出即加密并删除明文，列表识别 `.enc`，配套 `scripts/decrypt_backup.py`；生产未配置时启动打 warning |
 | 会话 | HttpOnly + SameSite + 滑动空闲 + 绝对过期 | 好；已加 60 秒写节流 |
 | 请求体 | 累计字节数 + 413 | 已修；注意 FastAPI 会吞 body 读取异常，实现上不能靠抛异常 |
 
@@ -139,14 +141,38 @@
 
 ## 六、可观测性
 
-已有：structlog JSON 日志、`X-Request-Id` 贯穿、审计哈希链、`/healthz` `/readyz` 分离。
+已有：structlog JSON 日志、`X-Request-Id` 贯穿（并透传给 LiteLLM）、审计哈希链、
+`/healthz` `/readyz` 分离，以及本批新增的 Prometheus 指标。
 
-缺：
-1. **指标**：没有 Prometheus 端点。至少应暴露 QPS、P95 延迟、402/429/5xx 比例、预扣未结清数量、
-   LiteLLM 注册失败数（`registry_error` 非空计数）。
-2. **链路追踪**：跨 API → LiteLLM → 上游没有 trace id 传递。LiteLLM 支持透传 `x-request-id`，
-   建议在 `_headers()` 里带上，出问题能一条链路查到上游。
-3. **告警**：`usage` 长期 `pending`、`balance_holds` 堆积、`registry_error` 增长，都应触发告警而不是只写日志。
+### 6.1 `/metrics`
+
+零依赖实现（`core/metrics.py`，不引入 `prometheus_client`，免去锁文件同步），
+text exposition 0.0.4，可被 Prometheus / VictoriaMetrics 直接抓取。
+
+| 指标 | 类型 | 用途 |
+| --- | --- | --- |
+| `forge_http_requests_total{method,route,status}` | counter | QPS、状态码分布 |
+| `forge_http_request_duration_seconds{method,route}` | histogram | P95/P99（流式接口耗时为整条 SSE，已从延迟告警排除） |
+| `forge_http_inflight_requests` | gauge | 并发压力 |
+| `forge_api_errors_total{code}` | counter | 业务错误码分布（含 402/429/上游失败） |
+| `forge_balance_holds_pending` / `_amount` | gauge | 预扣堆积——余额冻结的第一现场 |
+| `forge_usage_pending` | gauge | 长期 pending 的结算记录 |
+| `forge_model_registry_errors` | gauge | 未成功注册到 LiteLLM 的 deployment 数 |
+
+三个业务 gauge 直接查库，但带 15 秒进程内缓存；`/metrics` 刻意不依赖 `get_db`，
+DB 挂掉时仍能抓到进程指标——「数据库不可用但进程还活着」正是最需要看到的时刻。
+路由标签会把 UUID / 数字折叠为 `{id}` 并截断到四段，防止扫描器制造无限时间序列。
+
+### 6.2 告警
+
+`deploy/prometheus/alerts.yml` 提供 7 条规则：实例失联、5xx 比例 > 2%、上游持续失败、
+注册失败、预扣堆积、pending 堆积、非流式 P95 > 2s。
+
+### 6.3 仍然缺的
+
+1. **分布式追踪**：目前是「请求 ID 串联日志」，不是 span 级追踪。跨 API → LiteLLM → Provider
+   的耗时拆解需要 OpenTelemetry，属于下一阶段；
+2. **前端 RUM**：首屏、交互延迟没有采集，只能从 nginx 日志推断。
 
 ## 七、依赖与版本
 
@@ -157,7 +183,7 @@
 
 ## 八、优化清单
 
-**已落地（本次）**
+**已落地（第一批）**
 
 - 模型上架/下架/换凭证/部署状态 → LiteLLM 同步 + 对账 cron；
 - 限流与并发闸 Redis 化（故障自动降级）；
@@ -165,15 +191,25 @@
 - nginx 流式超时 600s、补齐 `X-Real-IP`；
 - 请求体超限真正生效（含 chunked）。
 
-**建议排期**
+**已落地（第二批：可观测性与运维闭环）**
 
-1. LiteLLM 日志表保留策略 / 关闭 request_logs 落库（防 PG 膨胀）；
-2. Redis 按用途分 db 或分实例，队列实例 `noeviction`；
-3. uvicorn `--workers` 与连接池联动，必要时上 PgBouncer；
-4. 备份加密 + 保留期；
-5. Prometheus 指标 + 关键告警（预扣堆积、注册失败、5xx 比例）；
-6. 「按流水重算余额快照」的运维工具；
-7. 前端 `pnpm audit` 进 CI。
+1. `/metrics` + 7 条告警规则（预扣堆积、结算 pending、注册失败、5xx 比例等）；
+2. `GET /api/admin/ledger/reconcile`：按流水重算快照，只读比对 + `apply` 修复并写审计；
+3. 备份加密（Fernet）+ 解密脚本 + 生产未配置时启动告警；
+4. LiteLLM 日志保留策略：`purge_litellm_logs` 每日分批删除 + 关闭消息正文落库；
+5. uvicorn 2 workers 与连接池联动（`DB_POOL_SIZE` / `DB_MAX_OVERFLOW`）；
+6. Redis 限流库分 db（db1），与 arq 队列（db0）隔离；
+7. nginx 边缘限流（登录 5r/s、`/v1` 30r/s + 并发上限）；
+8. 网关透传 `x-request-id` 给 LiteLLM；
+9. CI 增加 `pnpm audit`。
+
+**仍建议排期**
+
+1. Key 缓存 Redis 化：多 worker 下吊销最长 30 秒才全量生效；
+2. RBAC 细粒度复核（`admin:access` 仍偏粗）；
+3. 规模再上一档时上 PgBouncer，并把 LiteLLM 库拆到独立实例；
+4. GB 级备份改用 `age`/`gpg` 流式加密；
+5. worker 多副本时为 cron 加 Redis 分布式锁（当前任务幂等，重复触发只浪费锁竞争）。
 
 ## 九、一句话总结
 

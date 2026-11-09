@@ -30,3 +30,16 @@ def test_redacts_private_key_block() -> None:
     cleaned = redact(text)
     assert "ABCDEF" not in str(cleaned)
     assert cleaned == REDACTED
+
+
+def test_redacts_new_secret_settings() -> None:
+    """新增密钥字段不能因为名字不匹配而落进日志。"""
+    payload = {
+        "backup_encryption_key": "Zm9yZ2UtYmFja3VwLWtleS1ub3QtcmVhbA==",
+        "litellm_database_url": "postgresql://forge:pw@postgres/litellm",
+        "redis_rate_limit_url": "redis://:pw@redis:6379/1",
+        "metrics_token": "scrape-token",
+    }
+    cleaned = redact(payload)
+    for key in payload:
+        assert cleaned[key] == REDACTED, key

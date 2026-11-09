@@ -48,6 +48,19 @@ docker compose --env-file .env -f deploy/docker-compose.yml up --build
 
 管理端「备份」优先 `pg_dump`（API 镜像已装 `postgresql-client`）；本机无客户端时可设 `PG_DUMP_PATH` / `BACKUP_ALLOW_DOCKER`，再不行则用应用内 SQL 逻辑导出（`.sql`）。无一键在线恢复；恢复演练仍属运维手工流程。
 
+## 监控与运维接口
+
+- `GET /metrics`：Prometheus 抓取端点。`METRICS_TOKEN` 非空时需 `Authorization: Bearer <token>`；
+  nginx 默认不代理该路径，只在容器网络内可达。抓取与告警配置见 `deploy/prometheus/alerts.yml`。
+- `GET /api/admin/ledger/reconcile`：按流水重算余额快照并列出差异（只读，`admin:access`）；
+  加 `?apply=true` 会修复并写审计链，需要 `ledger:adjust`（默认只有 superadmin）。
+  建议每月或每次资金类故障后跑一次只读比对。
+- 备份加密：设置 `BACKUP_ENCRYPTION_KEY` 后，导出即加密为 `.dump.enc` / `.sql.enc` 并删除明文。
+  恢复前用 `BACKUP_ENCRYPTION_KEY=... python scripts/decrypt_backup.py <file>.enc` 解密。
+  密钥丢失等于备份不可恢复，必须与数据库口令分开保管。
+- worker 每日 04:20 执行 `purge_litellm_logs`，按 `LITELLM_LOG_RETENTION_DAYS`（默认 30 天）
+  分批清理 LiteLLM 的日志表；未配置 `LITELLM_DATABASE_URL` 时自动跳过。
+
 ## 超管初始化
 
 `scripts/init_admin.py` 用 CSPRNG 生成 `init_` 令牌，只打印一次，并把 SHA-256 写到 `.data/admin_init_token.sha256`。阶段 3 才会用它创建超级管理员。摘要文件已存在时脚本拒绝覆盖。

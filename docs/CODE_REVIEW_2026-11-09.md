@@ -268,3 +268,41 @@ API 侧有 `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy`（`c
 | 新增 | **执行面断链**：模型上架只写自家库，LiteLLM `model_list` 为空 | 见 `docs/ARCHITECTURE_REVIEW.md` 第二节：新增 `providers/litellm_registry.py`，上架/下架/换凭证/部署状态变更时同步 LiteLLM；新增对账 cron 与 `registry_synced_at` / `registry_error`（迁移 0020） | 新增同步用例断言 payload |
 
 仍未处理：P2-8 备份加密、P2-1 RBAC 细粒度复核、P3 级别的可观测性增强，见架构评估「待办」。`X-Request-Id` 目前仍接受客户端值，若后续要彻底防伪造，可改为「客户端值仅作为日志关联字段，usage 主键一律服务端生成」。
+
+---
+
+## 十、第三批：可观测性与运维闭环（2026-11-09 晚）
+
+上一批把「资金与鉴权的不变量」补住了，这一批解决「出了问题能不能第一时间发现」和
+「出问题后能不能自证」。全部改动通过 `ruff` / `mypy` / `pytest`（113 passed / 1 skipped）。
+
+| 方向 | 落地内容 | 位置 |
+| --- | --- | --- |
+| 指标 | 零依赖指标注册表（counter / histogram / gauge），暴露 `/metrics`（text 0.0.4）；可选 `METRICS_TOKEN` 鉴权；DB 故障时仍返回进程指标 | `core/metrics.py`、`api/routes.py` |
+| HTTP 观测 | 中间件记录请求量、状态码、耗时直方图、in-flight；路径中的 UUID / 数字折叠为 `{id}`，避免标签基数爆炸 | `core/middleware.py` |
+| 业务指标 | 预扣未结清笔数与金额、`usage` 长期 pending 数、LiteLLM 注册失败数；15 秒进程内缓存，避免抓取打爆 DB | `ops/metrics.py` |
+| 错误分布 | `AppError` 与 404/405 统一计入 `forge_api_errors_total{code}` | `core/errors.py` |
+| 告警 | 7 条 Prometheus 规则：实例失联、5xx 比例、上游持续失败、注册失败、预扣堆积、pending 堆积、非流式 P95 | `deploy/prometheus/alerts.yml` |
+| 账本对账 | `GET /api/admin/ledger/reconcile`：按流水重算 balance / frozen、按预扣表重算 held；`apply=true` 修复并写审计链，需 `ledger:adjust` | `ops/ledger_audit.py`、`ops/router.py` |
+| 备份加密 | `BACKUP_ENCRYPTION_KEY`（Fernet）开启后，导出即加密并删除明文；列表可识别 `.enc`；配套 `scripts/decrypt_backup.py` | `ops/platform.py`、`scripts/` |
+| PG 膨胀 | worker 新增 `purge_litellm_logs`：按保留期分批删除 LiteLLM 日志表；LiteLLM 侧同时关闭消息正文落库 | `worker.py`、`deploy/litellm/config.yaml` |
+| 多进程 | uvicorn `--workers`（默认 2）与 `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` 联动，compose 按 2 workers 下调连接池 | `apps/api/Dockerfile`、compose |
+| Redis 隔离 | 限流/并发闸改用 `REDIS_RATE_LIMIT_URL`（db1），与 arq 队列（db0）分库 | `core/config.py`、`main.py` |
+| 边缘限流 | nginx 按 IP 分桶：登录类 5r/s、`/v1` 30r/s + 并发上限，先挡一层再进应用 | `deploy/nginx/nginx.conf` |
+| 链路追踪 | 网关转发时把 `x-request-id` 传给 LiteLLM，可一路查到 Provider | `gateway/service.py` |
+| 依赖审计 | CI 增加 `pnpm audit --prod --audit-level high` | `.github/workflows/ci.yml` |
+
+### 这一批里值得记住的两个坑
+
+1. **`/metrics` 不能依赖 `get_db`**：数据库挂了才更需要指标。端点直接从 `app.state.sessionmaker`
+   取会话并吞掉业务指标异常，保证「DB 不可用但进程活着」这个状态可被抓取到。
+2. **备份加密要先校验密钥再导出**：否则密钥配错时会先在磁盘留下一个明文 dump，加密失败的
+   异常反而成了次要问题。
+
+### 仍未处理（按优先级）
+
+1. **RBAC 细粒度复核**（P2-1）：`admin:access` 仍是粗粒度闸门，财务与客服角色边界需按业务再切；
+2. **Key 缓存 Redis 化**：多 worker 下 `MemoryKeyCache` 各存一份，吊销最长 30 秒才全量生效（有界，但不够快）；
+3. **PgBouncer / LiteLLM 库拆分**：当前 2 workers 的连接数仍在安全区，规模再上一个量级才需要；
+4. **流式备份加密**：现为整文件 Fernet，GB 级库应换 `age`/`gpg`；
+5. **跨实例 cron 锁**：worker 保持单副本即可；多副本时 cron 会重复触发（任务幂等，但会抢锁）。

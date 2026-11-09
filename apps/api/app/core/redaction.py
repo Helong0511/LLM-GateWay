@@ -28,9 +28,12 @@ _SENSITIVE_KEYS = {
     "recovery_code",
     "session_secret",
     "encryption_master_key",
+    "backup_encryption_key",
     "litellm_master_key",
     "database_url",
+    "litellm_database_url",
     "redis_url",
+    "redis_rate_limit_url",
 }
 
 _SECRET_VALUE = re.compile(
