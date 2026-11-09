@@ -1221,6 +1221,8 @@ CREATE TABLE public.model_deployments (
     model_id uuid NOT NULL,
     provider_id uuid NOT NULL,
     status character varying(16) DEFAULT 'active'::character varying NOT NULL,
+    registry_synced_at timestamp with time zone,
+    registry_error text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT ck_model_deployments_status CHECK (((status)::text = ANY (ARRAY[('active'::character varying)::text, ('disabled'::character varying)::text])))
 );

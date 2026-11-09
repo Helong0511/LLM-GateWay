@@ -62,6 +62,9 @@ class Settings(BaseSettings):
 
     litellm_base_url: str = "http://127.0.0.1:4000"
     litellm_master_key: str = "sk-dev-only-litellm-master-key"
+    # 上架/下架/换凭证时把 deployment 同步到 LiteLLM Admin API。
+    # 关闭后 /v1 仍会转发，但 LiteLLM 侧不会知道新模型（仅用于离线调试）。
+    litellm_sync_enabled: bool = True
 
     smtp_host: str = ""
     smtp_port: int = 1025
