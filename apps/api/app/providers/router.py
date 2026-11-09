@@ -76,10 +76,14 @@ class DeploymentStatusBatchBody(BaseModel):
 def _service(request: Request, db: AsyncSession) -> ProviderService:
     resolver = getattr(request.app.state, "ssrf_resolver", default_resolver)
     client = getattr(request.app.state, "upstream_client", None)
-    # 构造一个 httpx.BaseTransport 给 service（它用 transport 参数）
-    # 但 service 内部 _probe_request / _upstream_models 会覆盖
-    transport = client if isinstance(client, httpx.AsyncBaseTransport) else None
-    return ProviderService(db, request.app.state.clock, request.app.state.settings, resolver, transport, upstream_client=client)
+    # transport 用于测试/私有链路注入，与服务内部 client 是两个独立入口：
+    # 早前误把 AsyncClient 当 transport 传，isinstance 恒 False，注入通道被静默丢弃。
+    transport = getattr(request.app.state, "upstream_transport", None)
+    if not isinstance(transport, httpx.AsyncBaseTransport):
+        transport = None
+    return ProviderService(
+        db, request.app.state.clock, request.app.state.settings, resolver, transport, upstream_client=client
+    )
 
 
 @catalog_router.get("/api/console/models")

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -75,6 +77,28 @@ class ProviderService:
         self.resolver = resolver
         self.transport = transport
         self.client = upstream_client  # 全局持久化 httpx.AsyncClient（连接池复用）
+
+    @asynccontextmanager
+    async def _http(self, timeout: float) -> AsyncIterator[httpx.AsyncClient]:
+        """按优先级返回上游客户端。
+
+        transport（测试/私有链路注入）必须高于 upstream_client，否则注入被全局
+        客户端覆盖，请求会真的外连——与网关侧 P1-1 同类缺陷。
+        """
+        if self.transport is not None:
+            async with httpx.AsyncClient(transport=self.transport, timeout=timeout) as client:
+                yield client
+            return
+        if self.client is not None:
+            existing = self.client.timeout
+            self.client.timeout = httpx.Timeout(timeout)
+            try:
+                yield self.client
+            finally:
+                self.client.timeout = existing
+            return
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            yield client
 
     async def create(self, actor_id: UUID, name: str, kind: str, base_url: str) -> dict[str, object]:
         if kind not in _KINDS:
@@ -588,35 +612,17 @@ class ProviderService:
             allowlist = await self._allowlist()
         headers = auth_headers(provider.kind, provider.base_url, token)
         url = join_api_url(provider.base_url, path)
-        if self.client is not None:
-            # 复用全局 client → 连接池命中 → 极快
-            existing_timeout = self.client.timeout
-            self.client.timeout = httpx.Timeout(timeout)
-            try:
-                response = await fetch_checked(
-                    self.client,
-                    "GET" if mode == "connect" else "POST",
-                    url,
-                    resolver=self.resolver,
-                    allowlist=allowlist,
-                    endpoint_kind=provider.kind,
-                    headers=headers,
-                    json_body=body,
-                )
-            finally:
-                self.client.timeout = existing_timeout
-        else:
-            async with httpx.AsyncClient(transport=self.transport, timeout=timeout) as client:
-                response = await fetch_checked(
-                    client,
-                    "GET" if mode == "connect" else "POST",
-                    url,
-                    resolver=self.resolver,
-                    allowlist=allowlist,
-                    endpoint_kind=provider.kind,
-                    headers=headers,
-                    json_body=body,
-                )
+        async with self._http(timeout) as client:
+            response = await fetch_checked(
+                client,
+                "GET" if mode == "connect" else "POST",
+                url,
+                resolver=self.resolver,
+                allowlist=allowlist,
+                endpoint_kind=provider.kind,
+                headers=headers,
+                json_body=body,
+            )
         if not isinstance(response, httpx.Response):
             raise AppError(502, "PROVIDER_UPSTREAM_NO_RESPONSE")
         return response
@@ -626,24 +632,12 @@ class ProviderService:
         allowlist = await self._allowlist()
         headers = auth_headers(provider.kind, provider.base_url, secret)
         url = join_api_url(provider.base_url, models_path)
-        if self.client is not None:
-            existing_timeout = self.client.timeout
-            self.client.timeout = httpx.Timeout(provider.timeout_seconds)
-            try:
-                response = await fetch_checked(
-                    self.client, "GET", url,
-                    resolver=self.resolver, allowlist=allowlist,
-                    endpoint_kind=provider.kind, headers=headers,
-                )
-            finally:
-                self.client.timeout = existing_timeout
-        else:
-            async with httpx.AsyncClient(transport=self.transport, timeout=provider.timeout_seconds) as client:
-                response = await fetch_checked(
-                    client, "GET", url,
-                    resolver=self.resolver, allowlist=allowlist,
-                    endpoint_kind=provider.kind, headers=headers,
-                )
+        async with self._http(provider.timeout_seconds) as client:
+            response = await fetch_checked(
+                client, "GET", url,
+                resolver=self.resolver, allowlist=allowlist,
+                endpoint_kind=provider.kind, headers=headers,
+            )
         if not isinstance(response, httpx.Response) or response.status_code >= 400:
             raise AppError(502, "PROVIDER_MODELS_FETCH_FAILED")
         payload = response.json()
