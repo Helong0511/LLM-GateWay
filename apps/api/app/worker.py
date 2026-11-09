@@ -151,6 +151,9 @@ class _NullCache:
     async def set(self, key: str, value: str) -> None:  # noqa: ARG002
         return None
 
+    async def delete(self, key: str) -> None:  # noqa: ARG002
+        return None
+
 
 async def verify_audit_chain(ctx: dict[str, object]) -> dict[str, object]:
     """校验审计哈希链。只读，链断裂时记错误日志。"""

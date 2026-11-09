@@ -64,18 +64,25 @@ class RequestContextMiddleware:
         # Content-Length 可以被省略（chunked），因此必须在读取过程中累计字节数。
         received = 0
         started = False
+        # 不能在 receive() 里抛异常：FastAPI 会把 body 读取阶段的任意异常
+        # 兜底成 HTTPException(400)，超限信号会被吞掉，chunked 请求因此绕过上限。
+        # 改为「截断输入 + 丢弃应用响应 + 自回 413」。
+        too_large = False
 
         async def limited_receive() -> Message:
-            nonlocal received
+            nonlocal received, too_large
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > self.max_body_bytes:
-                    raise _BodyTooLarge
+                    too_large = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
             return message
 
         async def send_with_id(message: Message) -> None:
             nonlocal started
+            if too_large:
+                return  # 应用对截断输入的响应一律丢弃，由下面统一回 413
             if message["type"] == "http.response.start":
                 started = True
                 raw_headers = list(message.get("headers", []))
@@ -106,12 +113,13 @@ class RequestContextMiddleware:
         try:
             await self.app(scope, limited_receive, send_with_id)
         except _BodyTooLarge:
-            # 响应已经开始就不能再写第二份；此时只能让连接中断，由客户端感知。
-            if not started:
+            # 兼容自定义应用直接抛出信号的路径。
+            too_large = True
+        finally:
+            if too_large and not started:
                 request = Request(scope)
                 response = failure(
                     request, 413, "PAYLOAD_TOO_LARGE", f"请求体超过 {self.max_body_bytes} 字节限制"
                 )
                 await response(scope, receive, send)
-        finally:
             structlog.contextvars.clear_contextvars()

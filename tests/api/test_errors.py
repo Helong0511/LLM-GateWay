@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 import pytest
 from app.core.config import Settings
 from app.core.readiness import StaticProbes
@@ -57,7 +59,16 @@ async def test_unhandled_error_hides_internals() -> None:
 async def test_body_over_limit_is_rejected() -> None:
     app = create_app(Settings(max_body_bytes=32), probes=StaticProbes(True, True))
     transport = ASGITransport(app=app)
+    async def _chunks() -> AsyncIterator[bytes]:
+        for _ in range(3):
+            yield b"y" * 20
+
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post("/healthz", content=b"x" * 64)
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+        # chunked（无 Content-Length）也必须被累计字节数拦住；
+        # /healthz 只接受 GET，405 不会读 body，所以这里打到真正解析 body 的路由。
+        streamed = await client.post("/api/auth/login", content=_chunks())
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
+    assert streamed.status_code == 413
+    assert streamed.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"

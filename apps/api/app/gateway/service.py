@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -410,7 +411,7 @@ class GatewayService:
         prepared: PreparedCall,
         *,
         http_status: int,
-        started: object,
+        started: datetime,
         finish_reason: str = "error",
     ) -> None:
         """上游不可达 / 超时 / 异常时把预扣结清。

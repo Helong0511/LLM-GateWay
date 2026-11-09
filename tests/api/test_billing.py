@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import AsyncIterator
 from decimal import Decimal
@@ -288,16 +289,35 @@ async def test_tc_bill_003_gateway_charges_reported_usage_and_rejects_empty_bala
 
 @pytest.mark.asyncio
 async def test_tc_conc_001_parallel_recharge_credits_once() -> None:
-    engine = create_async_engine("postgresql+asyncpg://forge:forge-dev-only@127.0.0.1:5432/forge")
+    """真实 PG 上的并发幂等用例。
+
+    仅当库可用、迁移已执行、且连接角色是表属主时才跑：
+    清理阶段需要 DISABLE TRIGGER / DELETE，非属主会抛 InsufficientPrivilege
+    把用例变成"环境红"，掩盖真正的并发缺陷。
+    """
+    dsn = os.environ.get(
+        "FORGE_TEST_PG_DSN",
+        "postgresql+asyncpg://forge:forge-dev-only@127.0.0.1:5432/forge",
+    )
+    engine = create_async_engine(dsn)
     try:
         async with engine.connect() as conn:
             ready = await conn.scalar(text("SELECT to_regclass('public.account_ledger')"))
+            owner_ok = await conn.scalar(
+                text(
+                    "SELECT pg_get_userbyid(c.relowner) = current_user "
+                    "FROM pg_class c WHERE c.oid = to_regclass('public.account_ledger')"
+                )
+            )
     except (OSError, DBAPIError):
         await engine.dispose()
         pytest.skip("PostgreSQL 不可用")
     if ready is None:
         await engine.dispose()
         pytest.skip("账本迁移还没有执行")
+    if not owner_ok:
+        await engine.dispose()
+        pytest.skip("当前角色不是 account_ledger 属主，无法清理数据")
     user_id = uuid4()
     maker = async_sessionmaker(engine, expire_on_commit=False)
     try:

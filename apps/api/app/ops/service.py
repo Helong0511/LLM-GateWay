@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import func, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -458,7 +460,7 @@ class OpsService:
             .values(used_count=Coupon.used_count + 1)
             .execution_options(synchronize_session=False)
         )
-        if claimed.rowcount != 1:
+        if cast(CursorResult[Any], claimed).rowcount != 1:
             raise AppError(409, "COUPON_EXHAUSTED")
         self.session.add(CouponRedemption(coupon_id=coupon.id, user_id=user_id, created_at=now))
         try:
