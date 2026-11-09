@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.errors import AppError
 from app.core.messages_en import MESSAGE_BY_CODE_EN
+from app.core.request_ip import client_ip
 from app.gateway.limit import MemoryRateLimiter, MemorySlots
 from app.gateway.service import GatewayService, closed_path
 from app.keys.cache import MemoryKeyCache
@@ -154,7 +155,7 @@ async def _forward(request: Request, *, require_embeddings: bool) -> JSONRespons
         return _openai(AppError(400, "BODY_MUST_BE_JSON"))
     if not isinstance(body, dict):
         return _openai(AppError(400, "BODY_MUST_BE_JSON_OBJECT"))
-    ip = request.client.host if request.client else None
+    ip = client_ip(request) or None
     request_id = str(getattr(request.state, "request_id", "unknown"))
     prepared = None
     try:

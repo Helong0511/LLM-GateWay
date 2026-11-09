@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing.money import DEFAULT_DIRECTION, ENTRY_TYPES, currency_code, format_money, q
 from app.core.clock import Clock
-from app.core.errors import AppError
+from app.core.errors import BALANCE_INSUFFICIENT, AppError
 from app.db.models.billing import AccountBalance, AccountLedger, BalanceHold
 
 
@@ -79,7 +79,7 @@ class LedgerService:
                 new_held = q(balance.held + hold_delta)
                 new_frozen = q(balance.frozen + frozen_delta)
                 if min(new_balance, new_held, new_frozen) < 0 or new_balance < q(new_held + new_frozen):
-                    raise AppError(402, "BALANCE_INSUFFICIENT")
+                    raise AppError(402, BALANCE_INSUFFICIENT)
                 entry = AccountLedger(
                     user_id=user_id,
                     entry_type=entry_type,
@@ -265,7 +265,7 @@ class LedgerService:
                 entry_id = extra_entry.id
                 total = charged
             except AppError as exc:
-                if exc.code != "INSUFFICIENT_BALANCE":
+                if exc.code != BALANCE_INSUFFICIENT:
                     raise
                 status = "disputed"
                 total = taken
@@ -275,10 +275,18 @@ class LedgerService:
         await self.session.flush()
         return Settlement(total, status, hold.id, entry_id)
 
-    async def release_expired(self) -> int:
+    async def release_expired(self, limit: int = 200) -> int:
+        """释放到期预扣。
+
+        `limit` 用于分批：积压时不至于一次性把全表读进内存、也不会撞 worker 的
+        job_timeout。返回本批处理条数，调用方可据此继续下一批。
+        """
         now = self.clock.now()
         result = await self.session.execute(
-            select(BalanceHold).where(BalanceHold.status == "held", BalanceHold.expires_at <= now)
+            select(BalanceHold)
+            .where(BalanceHold.status == "held", BalanceHold.expires_at <= now)
+            .order_by(BalanceHold.expires_at.asc())
+            .limit(limit)
         )
         count = 0
         for hold in result.scalars().all():

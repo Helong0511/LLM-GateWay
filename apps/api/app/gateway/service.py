@@ -10,6 +10,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -32,6 +33,8 @@ _CLOSED = {
     "/v1/batches",
     "/v1/images/generations",
 }
+
+logger = structlog.get_logger("forgeapi.gateway")
 
 
 @dataclass
@@ -106,6 +109,9 @@ class GatewayService:
         try:
             usage = await self.keys.start_usage(user.id, row.id, request_id, model_name)
             usage.is_stream = body.get("stream") is True
+            # start_usage 在检测到 request_id 撞车时会改用带随机后缀的键，
+            # 后续预扣/结算必须跟随这个真实键，否则会找不到对应的 usage。
+            request_id = usage.request_id
             await record_call(
                 self.session,
                 user_id=user.id,
@@ -164,7 +170,11 @@ class GatewayService:
     async def complete(self, prepared: PreparedCall) -> dict[str, Any]:
         started = self.clock.now()
         try:
-            response = await self._post("/v1/chat/completions", prepared.payload)
+            try:
+                response = await self._post("/v1/chat/completions", prepared.payload)
+            except AppError as exc:
+                await self._settle_unsuccessful(prepared, http_status=exc.status_code, started=started)
+                raise
             latency = _millis(self.clock.now() - started)
             if response.status_code >= 400:
                 await self._billing().finish(
@@ -233,8 +243,11 @@ class GatewayService:
         finish = "stop"
         status = 200
         try:
-            client = self.client or httpx.AsyncClient(transport=self.transport, timeout=60)
-            own = self.client is None
+            reuse = self.client is not None and self.transport is None
+            client = self.client if reuse and self.client is not None else httpx.AsyncClient(
+                transport=self.transport, timeout=60
+            )
+            own = not reuse
             try:
                 async with client.stream(
                     "POST",
@@ -264,6 +277,11 @@ class GatewayService:
                 'data: {"error":{"message":"上游暂时繁忙，请稍后再试",'
                 '"type":"upstream_error","code":"UPSTREAM_ERROR"}}\n\n'
             )
+        except Exception:
+            # 任何非 HTTPError 的中断都必须标记为失败，否则 finally 会按 200 计费。
+            status = 502
+            finish = "error"
+            raise
         finally:
             self.slots.release(prepared.slot_key, prepared.concurrency_limit)
             source = "reported"
@@ -315,7 +333,11 @@ class GatewayService:
     async def embeddings(self, prepared: PreparedCall) -> dict[str, Any]:
         started = self.clock.now()
         try:
-            response = await self._post("/v1/embeddings", prepared.payload)
+            try:
+                response = await self._post("/v1/embeddings", prepared.payload)
+            except AppError as exc:
+                await self._settle_unsuccessful(prepared, http_status=exc.status_code, started=started)
+                raise
             latency = _millis(self.clock.now() - started)
             if response.status_code >= 400:
                 await self._billing().finish(
@@ -373,9 +395,9 @@ class GatewayService:
         http_status: int,
         finish_reason: str,
     ) -> None:
-        await self.keys.start_usage(user_id, api_key_id, request_id, model_name)
+        usage = await self.keys.start_usage(user_id, api_key_id, request_id, model_name)
         await self.keys.finalize_usage(
-            request_id,
+            usage.request_id,
             input_tokens=0,
             output_tokens=0,
             http_status=http_status,
@@ -383,13 +405,53 @@ class GatewayService:
             usage_source="reported",
         )
 
+    async def _settle_unsuccessful(
+        self,
+        prepared: PreparedCall,
+        *,
+        http_status: int,
+        started: object,
+        finish_reason: str = "error",
+    ) -> None:
+        """上游不可达 / 超时 / 异常时把预扣结清。
+
+        以前这里直接抛错，`complete()` 的 finally 只释放并发槽，预扣会一直停在
+        `held`；配合缺失的 cron 调度就是「余额永久冻结」。结算失败不能掩盖原始
+        错误，所以这里只记日志。
+        """
+        try:
+            await self._billing().finish(
+                request_id=prepared.request_id,
+                input_tokens=0,
+                output_tokens=0,
+                http_status=http_status,
+                finish_reason=finish_reason,
+                latency_ms=_millis(self.clock.now() - started),
+                usage_source="reported",
+                chargeable=False,
+            )
+        except Exception:  # noqa: BLE001 - 结算失败不能掩盖上游错误
+            logger.warning(
+                "gateway_settle_failed",
+                request_id=prepared.request_id,
+                http_status=http_status,
+                exc_info=True,
+            )
+
     async def _post(self, path: str, payload: dict[str, Any]) -> httpx.Response:
+        # transport 优先：测试与自建端点通过它注入替身，不能被全局 client 覆盖。
+        if self.transport is not None:
+            async with httpx.AsyncClient(transport=self.transport, timeout=60) as client:
+                try:
+                    return await client.post(self._url(path), headers=self._headers(), json=payload)
+                except httpx.HTTPError as exc:
+                    raise AppError(503, "GATEWAY_UPSTREAM_UNREACHABLE") from exc
         if self.client is not None:
             try:
                 return await self.client.post(self._url(path), headers=self._headers(), json=payload)
             except httpx.HTTPError as exc:
                 raise AppError(503, "GATEWAY_UPSTREAM_UNREACHABLE") from exc
-        async with httpx.AsyncClient(transport=self.transport, timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             try:
                 return await client.post(self._url(path), headers=self._headers(), json=payload)
             except httpx.HTTPError as exc:

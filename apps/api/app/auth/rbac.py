@@ -45,12 +45,25 @@ PERMISSIONS: tuple[tuple[str, str, str], ...] = (
 
 ROLE_GRANTS: dict[str, tuple[str, ...]] = {
     "user": (),
-    "support": (),
+    # support / operator 之前没有任何权限，登录后台必然 403，角色形同虚设。
+    # 两者都只给只读后台入口，写操作仍按最小权限单独授予。
+    "support": ("admin:access",),
     "finance": ("refund:request",),
-    "operator": (),
-    "model_ops": ("provider:credential:read", "provider:manage", "model:publish"),
+    "operator": ("admin:access",),
+    "model_ops": ("provider:credential:read", "provider:manage", "model:publish", "admin:access"),
     "admin": ("admin:access", "refund:execute", "user:ban", "rbac:assign", "provider:manage", "model:publish"),
-    "superadmin": ("admin:access", "user:ban", "rbac:assign", "ledger:adjust"),
+    # superadmin 是兜底角色，但**不能**同时拥有 refund:request，
+    # 否则退款「申请/复核/执行」三方分离的约束会被自己破掉。
+    "superadmin": (
+        "admin:access",
+        "user:ban",
+        "rbac:assign",
+        "ledger:adjust",
+        "provider:credential:read",
+        "provider:manage",
+        "model:publish",
+        "refund:execute",
+    ),
 }
 
 

@@ -406,34 +406,48 @@ class AuthService:
             raise AppError(403, "BOOTSTRAP_TOKEN_MISSING")
         expected = path.read_text(encoding="utf-8").strip().lower()
         actual = hashlib.sha256(token.encode()).hexdigest()
-        if not hmac.compare_digest(expected, actual):
+        if hmac.compare_digest(expected, actual) is not True:
             raise AppError(403, "BOOTSTRAP_TOKEN_INVALID")
-        if await self.repo.count_superadmins() > 0:
-            raise AppError(409, "BOOTSTRAP_ALREADY_DONE")
-        normalized = validate_email(email)
-        validate_password(password, normalized)
-        now = self.clock.now()
-        user = User(
-            email=email.strip(),
-            email_normalized=normalized,
-            password_hash=hash_password(password),
-            status="active",
-            failed_login_count=0,
-            totp_enabled=False,
-            terms_version=self.settings.terms_version,
-            terms_accepted_at=now,
-            privacy_version=self.settings.privacy_version,
-            privacy_accepted_at=now,
-            created_at=now,
-            updated_at=now,
-        )
-        self.repo.add(user)
-        await self.repo.session.flush()
-        self.repo.add(new_profile(user.id, now))
-        self.repo.add(UserRole(user_id=user.id, role_id=UUID(ROLE_IDS["superadmin"]), granted_at=now))
+        # 用「重命名口令文件」做原子的互斥：rename 在同一文件系统上是原子的，
+        # 并发请求里只有一个能把文件抢走，另一个会拿到 FileNotFoundError。
+        # 原来的「先数超管、再建号」存在 TOCTOU，两个请求可同时通过检查。
         consumed = path.with_name(path.name + ".consumed")
-        path.replace(consumed)
-        return AuthResult({"user_id": str(user.id), "role": "superadmin"})
+        try:
+            path.replace(consumed)
+        except OSError as exc:
+            raise AppError(403, "BOOTSTRAP_TOKEN_USED") from exc
+        try:
+            if await self.repo.count_superadmins() > 0:
+                raise AppError(409, "BOOTSTRAP_ALREADY_DONE")
+            normalized = validate_email(email)
+            validate_password(password, normalized)
+            now = self.clock.now()
+            user = User(
+                email=email.strip(),
+                email_normalized=normalized,
+                password_hash=hash_password(password),
+                status="active",
+                failed_login_count=0,
+                totp_enabled=False,
+                terms_version=self.settings.terms_version,
+                terms_accepted_at=now,
+                privacy_version=self.settings.privacy_version,
+                privacy_accepted_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            self.repo.add(user)
+            await self.repo.session.flush()
+            self.repo.add(new_profile(user.id, now))
+            self.repo.add(UserRole(user_id=user.id, role_id=UUID(ROLE_IDS["superadmin"]), granted_at=now))
+            return AuthResult({"user_id": str(user.id), "role": "superadmin"})
+        except Exception:
+            # 建号失败要把口令还原，否则系统会卡在「没有超管、口令却已被消费」的死角。
+            try:
+                consumed.replace(path)
+            except OSError:
+                pass
+            raise
 
     async def assign_role(self, actor: User, target_id: UUID, role_code: str) -> AuthResult:
         if role_code == "superadmin":

@@ -123,6 +123,11 @@ class PaymentOrder(Base):
     locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     provider_ref: Mapped[str | None] = mapped_column(String(128))
+    # 收银台跳转地址（Stripe Checkout Session url 等），下单后可直接返回给前端。
+    checkout_url: Mapped[str | None] = mapped_column(String(512))
+    # 最近一次「主动查单」的原始快照（JSON）。回调只与这里的快照比对，
+    # 避免每次回调都依赖外部网络，也留下可审计的凭证。
+    provider_snapshot: Mapped[str | None] = mapped_column(Text)
     tx_hash: Mapped[str | None] = mapped_column(String(128))
     confirmations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     actual_amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 8))

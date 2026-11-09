@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -449,7 +449,17 @@ class OpsService:
             raise AppError(409, "COUPON_ALREADY_REDEEMED")
         if coupon.used_count >= coupon.max_uses:
             raise AppError(409, "COUPON_EXHAUSTED")
-        coupon.used_count += 1
+        # 原子抢名额：条件更新 + 受影响行数判定。
+        # 原先「读 used_count → +1 → 写回」在并发下会丢更新，两个用户可同时
+        # 拿到最后一个名额（ck_coupons_uses 也不会报错，因为两次写入都合法）。
+        claimed = await self.session.execute(
+            update(Coupon)
+            .where(Coupon.id == coupon.id, Coupon.used_count < Coupon.max_uses)
+            .values(used_count=Coupon.used_count + 1)
+            .execution_options(synchronize_session=False)
+        )
+        if claimed.rowcount != 1:
+            raise AppError(409, "COUPON_EXHAUSTED")
         self.session.add(CouponRedemption(coupon_id=coupon.id, user_id=user_id, created_at=now))
         try:
             async with self.session.begin_nested():

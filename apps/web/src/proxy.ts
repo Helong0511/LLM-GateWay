@@ -25,11 +25,17 @@ export async function proxy(request: NextRequest) {
   // 透传 cookie + x-request-id 给后端验会话
   const requestHeaders = new Headers();
   const cookies = request.cookies.getAll();
-  for (const { name, value } of cookies) {
-    requestHeaders.set("cookie", `${name}=${value}`);
+  // 一次拼接全部 Cookie：循环里 set("cookie", ...) 只会保留最后一个，
+  // 同时存在 session 与 locale 时会被误判为未登录。
+  if (cookies.length > 0) {
+    requestHeaders.set("cookie", cookies.map(({ name, value }) => `${name}=${value}`).join("; "));
   }
   const rid = request.headers.get("x-request-id");
   if (rid) requestHeaders.set("x-request-id", rid);
+  const forwardedFor = request.headers.get("x-forwarded-for");
+  if (forwardedFor) requestHeaders.set("x-forwarded-for", forwardedFor);
+  const realIp = request.headers.get("x-real-ip");
+  if (realIp) requestHeaders.set("x-real-ip", realIp);
 
   const base = process.env.API_INTERNAL_URL ?? "http://127.0.0.1:8000";
   let meResponse: Response;

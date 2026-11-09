@@ -14,6 +14,10 @@ from app.core.errors import failure
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
 
 
+class _BodyTooLarge(Exception):
+    """内部信号：请求体在流式读取过程中超过上限。"""
+
+
 def resolve_request_id(header_value: str | None) -> str:
     if header_value and _REQUEST_ID.fullmatch(header_value):
         return header_value
@@ -50,13 +54,30 @@ class RequestContextMiddleware:
         content_length = headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > self.max_body_bytes:
             request = Request(scope)
-            response = failure(request, 400, "VALIDATION_ERROR", f"请求体超过 {self.max_body_bytes} 字节限制")
+            response = failure(
+                request, 413, "PAYLOAD_TOO_LARGE", f"请求体超过 {self.max_body_bytes} 字节限制"
+            )
             await response(scope, receive, send)
             structlog.contextvars.clear_contextvars()
             return
 
+        # Content-Length 可以被省略（chunked），因此必须在读取过程中累计字节数。
+        received = 0
+        started = False
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_body_bytes:
+                    raise _BodyTooLarge
+            return message
+
         async def send_with_id(message: Message) -> None:
+            nonlocal started
             if message["type"] == "http.response.start":
+                started = True
                 raw_headers = list(message.get("headers", []))
                 raw_headers.append((b"x-request-id", request_id.encode("ascii")))
                 raw_headers.extend(
@@ -83,6 +104,14 @@ class RequestContextMiddleware:
             await send(message)
 
         try:
-            await self.app(scope, receive, send_with_id)
+            await self.app(scope, limited_receive, send_with_id)
+        except _BodyTooLarge:
+            # 响应已经开始就不能再写第二份；此时只能让连接中断，由客户端感知。
+            if not started:
+                request = Request(scope)
+                response = failure(
+                    request, 413, "PAYLOAD_TOO_LARGE", f"请求体超过 {self.max_body_bytes} 字节限制"
+                )
+                await response(scope, receive, send)
         finally:
             structlog.contextvars.clear_contextvars()

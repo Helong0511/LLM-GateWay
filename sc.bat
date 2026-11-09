@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 REM 设置目标目录
-set "targetDir=E:\ZZZ"
+set "targetDir=D:\Users\18307\.workbuddy\LLM-GateWay"
 
 REM 检查目录是否存在
 if not exist "%targetDir%" (

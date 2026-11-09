@@ -38,6 +38,12 @@ class Settings(BaseSettings):
 
     mock_payments_enabled: bool = True
     demo_models_enabled: bool = True
+    # 真实支付网关配置。留空表示该渠道未接入：生产环境（mock 关闭）会被
+    # _assert_channel 直接拒绝，而不是留下一个「必然失败」的下单入口。
+    stripe_secret_key: str = ""
+    stripe_api_base: str = "https://api.stripe.com"
+    usdt_query_url: str = ""
+    usdt_query_token: str = ""
     stripe_webhook_secret: str = "dev-only-stripe-webhook-secret-32bytes"
     usdt_webhook_secret: str = "dev-only-usdt-webhook-secret-32bytes"
     usdt_callback_ips: str = ""

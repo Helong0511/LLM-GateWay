@@ -9,13 +9,20 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+# 资金类错误码只在这里定义一次，业务代码一律引用常量，禁止再写字符串字面量。
+# 历史上曾出现 BALANCE_INSUFFICIENT / INSUFFICIENT_BALANCE 两套写法并存，
+# 导致「实付超预扣 + 余额不足」时结算兜底失效（见 CODE_REVIEW_2026-11-09 P0-4）。
+BALANCE_INSUFFICIENT = "BALANCE_INSUFFICIENT"
+KEY_BUDGET_EXHAUSTED = "KEY_BUDGET_EXHAUSTED"
+
 CODE_BY_STATUS: dict[int, str] = {
     400: "VALIDATION_ERROR",
     401: "UNAUTHENTICATED",
-    402: "INSUFFICIENT_BALANCE",
+    402: BALANCE_INSUFFICIENT,
     403: "FORBIDDEN",
     404: "NOT_FOUND",
     409: "IDEMPOTENCY_CONFLICT",
+    413: "PAYLOAD_TOO_LARGE",
     429: "RATE_LIMITED",
     500: "INTERNAL",
     502: "UPSTREAM_ERROR",
@@ -27,7 +34,8 @@ MESSAGE_BY_CODE: dict[str, str] = {
     "UNAUTHENTICATED": "尚未登录，或登录已过期，请重新登录",
     "INVALID_API_KEY": "API Key 不正确或已失效",
     "FORBIDDEN": "当前账号没有执行此操作的权限",
-    "INSUFFICIENT_BALANCE": "余额或密钥预算不足",
+    "INSUFFICIENT_BALANCE": "余额或密钥预算不足",  # 历史等价码，仅为兼容旧客户端保留
+    "PAYLOAD_TOO_LARGE": "请求体超过大小限制，请减小后重试",
     "NOT_FOUND": "未找到对应内容",
     "IDEMPOTENCY_CONFLICT": "操作冲突，请刷新页面后重试",
     "RATE_LIMITED": "操作过于频繁，请稍后再试",
@@ -121,6 +129,7 @@ MESSAGE_BY_CODE: dict[str, str] = {
     "CHANNEL_NOT_ALLOWED_CN": "大陆模式不能使用 Stripe/USDT，请改用微信或支付宝",
     "CHANNEL_UNSUPPORTED": "不支持的支付渠道「{channel}」",
     "CHANNEL_NOT_CONFIGURED": "「{channel}」支付渠道尚未配置，暂时无法下单",
+    "CHANNEL_UPSTREAM_FAILED": "支付渠道暂时不可用，请稍后再试或更换渠道",
     "KEY_NAME_INVALID": "密钥名称需要在 1 到 128 个字符之间",
     "KEY_STATUS_INVALID": "密钥状态不支持，请使用列表中的状态",
     "KEY_NOT_FOUND": "密钥不存在",

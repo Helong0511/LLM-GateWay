@@ -145,7 +145,7 @@ class PaymentService:
         if channel == "usdt":
             await self._fill_usdt(order)
         elif channel == "stripe":
-            self._fill_stripe(order)
+            await self._fill_stripe(order)
         try:
             async with self.session.begin_nested():
                 await self.session.flush()
@@ -331,8 +331,11 @@ class PaymentService:
             return IngestResult(404, None, "NOT_FOUND", "回调对应的订单不存在")
         if order.status in _CREDITED:
             return IngestResult(200, self._public(order))
-        session = self.stripe.sessions.get(order.provider_ref or "")
-        if not isinstance(session, dict) or not _stripe_matches(order, parsed, session):
+        session = await self.stripe.query(order.provider_ref)
+        if not isinstance(session, dict):
+            return IngestResult(503, None, "DEPENDENCY_UNAVAILABLE", "主动查单没有返回这笔订单，请稍后再试")
+        order.provider_snapshot = json.dumps(session, ensure_ascii=False, sort_keys=True)
+        if not _stripe_matches(order, parsed, session):
             return IngestResult(400, None, "VALIDATION_ERROR", "Stripe 回调内容与主动查单结果不一致")
         await self._credit(order, order.amount, "recharge")
         order.status = "completed"
@@ -360,9 +363,14 @@ class PaymentService:
             return IngestResult(200, {"accepted": True, "order": self._public(order)})
         if order.status not in _OPEN:
             return IngestResult(200, {"accepted": False, "order": self._public(order)})
-        query = self.usdt.orders.get(order.order_no)
+        query = await self.usdt.query(
+            order.order_no,
+            address=order.pay_address,
+            network=order.network,
+        )
         if not isinstance(query, dict):
             return IngestResult(503, None, "DEPENDENCY_UNAVAILABLE", "主动查单没有返回这笔订单，请稍后再试")
+        order.provider_snapshot = json.dumps(query, ensure_ascii=False, sort_keys=True)
         if not isinstance(parsed, dict) or not _usdt_same(parsed, query):
             return IngestResult(400, None, "VALIDATION_ERROR", "USDT 回调内容与主动查单结果不一致")
         return await self._apply_usdt(order, query)
@@ -631,17 +639,17 @@ class PaymentService:
                 continue
         raise AppError(503, "USDT_TAIL_POOL_FULL")
 
-    def _fill_stripe(self, order: PaymentOrder) -> None:
-        ref = "cs_" + order.order_no
-        cents = int(q(order.amount) * 100)
-        self.stripe.sessions[ref] = {
-            "id": ref,
-            "order_no": order.order_no,
-            "amount_total": cents,
-            "currency": order.currency.lower(),
-            "payment_status": "unpaid",
-        }
-        order.provider_ref = ref
+    async def _fill_stripe(self, order: PaymentOrder) -> None:
+        product = await self.session.get(RechargeProduct, order.product_id)
+        name = product.name if product is not None else "Recharge"
+        session = await self.stripe.create(
+            order_no=order.order_no,
+            amount=order.amount,
+            currency=order.currency,
+            product_name=name,
+        )
+        order.provider_ref = session.ref
+        order.checkout_url = session.url
 
     async def _rate(self) -> tuple[Decimal, str]:
         from app.db.models.billing import ExchangeRate

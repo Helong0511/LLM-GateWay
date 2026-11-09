@@ -13,7 +13,7 @@ from app.billing.money import format_money, q, settlement_currency
 from app.billing.pricing import PricingService
 from app.core.clock import Clock
 from app.core.config import Settings
-from app.core.errors import AppError
+from app.core.errors import BALANCE_INSUFFICIENT, AppError
 from app.db.models.billing import BalanceHold, UsageSettlement
 from app.db.models.keys import ApiKey, UsageRecord
 from app.keys.cache import KeyCache
@@ -114,7 +114,7 @@ class BillingService:
                 currency=currency,
             )
         except AppError as exc:
-            if exc.code != "INSUFFICIENT_BALANCE":
+            if exc.code != BALANCE_INSUFFICIENT:
                 raise
             result = Settlement(Decimal("0"), "disputed", None, None)
         if usage.api_key_id is not None and result.amount > 0:
@@ -138,6 +138,40 @@ class BillingService:
             provider_cost=provider_cost,
             cached_tokens=cached_tokens,
         )
+
+    async def close_stale(self, *, older_than_seconds: int, limit: int = 200) -> int:
+        """把长期停在 pending 的用量结清。
+
+        进程崩溃、上游挂死会让 finish() 永远不被调用：预扣靠 TTL 能收回，
+        但 usage 会一直停在 pending，账单和对账都会失真。这里做兜底收敛。
+        """
+        from datetime import timedelta
+
+        cutoff = self.clock.now() - timedelta(seconds=older_than_seconds)
+        result = await self.session.execute(
+            select(UsageRecord)
+            .where(UsageRecord.settlement_status == "pending", UsageRecord.created_at <= cutoff)
+            .order_by(UsageRecord.created_at.asc())
+            .limit(limit)
+        )
+        count = 0
+        for usage in result.scalars().all():
+            settlement = await self.ledger.release_hold(usage.request_id)
+            self.session.add(
+                UsageSettlement(
+                    usage_record_id=usage.id,
+                    status="released",
+                    hold_id=settlement.hold_id,
+                    ledger_entry_id=settlement.ledger_entry_id,
+                    settled_at=self.clock.now(),
+                )
+            )
+            usage.settlement_status = "released"
+            usage.finish_reason = usage.finish_reason or "abandoned"
+            usage.ended_at = usage.ended_at or self.clock.now()
+            usage.user_charge = Decimal("0")
+            count += 1
+        return count
 
     async def _check_budget(self, api_key_id: UUID | None, amount: Decimal) -> None:
         if api_key_id is None:

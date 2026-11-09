@@ -13,4 +13,7 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
 EXPOSE 8000
-CMD ["uv", "run", "--frozen", "--no-dev", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --proxy-headers + --forwarded-allow-ips：让 request.client.host 变成真实客户端 IP。
+# 少这一行，注册限流会退化成「全站每小时 20 次」，Key / USDT 的 IP 白名单全部失效。
+# API 容器不允许对外发布端口（见 deploy/docker-compose.prod.yml），因此信任内网代理。
+CMD ["sh", "-c", "exec uv run --frozen --no-dev uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=\"${FORWARDED_ALLOW_IPS:-*}\" --no-server-header"]

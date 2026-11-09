@@ -6,9 +6,10 @@ import json
 import secrets
 from datetime import datetime, timedelta
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import case, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.audit import append_audit
@@ -274,23 +275,37 @@ class KeyService:
         return row
 
     async def start_usage(self, user_id: UUID, api_key_id: UUID | None, request_id: str, model_id: str | None) -> UsageRecord:
-        row = UsageRecord(
-            request_id=request_id,
-            user_id=user_id,
-            api_key_id=api_key_id,
-            model_id=model_id,
-            started_at=self.clock.now(),
-            input_tokens=0,
-            output_tokens=0,
-            cached_tokens=0,
-            currency="USD",
-            is_stream=False,
-            settlement_status="pending",
-            created_at=self.clock.now(),
-        )
-        self.session.add(row)
-        await self.session.flush()
-        return row
+        # request_id 来自调用方可以设置的 X-Request-Id，可能和历史记录撞车；
+        # usage_records.request_id 有唯一约束。撞了就退避成 `<id>-<8位随机>`，
+        # 这样既保留可检索性，也不会让正常请求 500。
+        key = request_id
+        last: IntegrityError | None = None
+        for _ in range(4):
+            row = UsageRecord(
+                request_id=key,
+                user_id=user_id,
+                api_key_id=api_key_id,
+                model_id=model_id,
+                started_at=self.clock.now(),
+                input_tokens=0,
+                output_tokens=0,
+                cached_tokens=0,
+                currency="USD",
+                is_stream=False,
+                settlement_status="pending",
+                created_at=self.clock.now(),
+            )
+            self.session.add(row)
+            try:
+                async with self.session.begin_nested():
+                    await self.session.flush()
+                return row
+            except IntegrityError as exc:
+                last = exc
+                if row in self.session:
+                    self.session.expunge(row)
+                key = f"{request_id[:48]}-{uuid4().hex[:8]}"
+        raise AppError(409, "IDEMPOTENCY_CONFLICT") from last
 
     async def finalize_usage(
         self,

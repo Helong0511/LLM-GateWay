@@ -15,14 +15,9 @@ from app.auth.tokens import as_utc, digest
 from app.core.clock import Clock
 from app.core.config import Settings
 from app.core.errors import AppError
+from app.core.request_ip import client_ip
 from app.db.models.auth import Session, User
 from app.db.session import get_db
-
-
-def client_ip(request: Request) -> str:
-    if request.client is None:
-        return ""
-    return request.client.host
 
 
 def user_agent(request: Request) -> str:
